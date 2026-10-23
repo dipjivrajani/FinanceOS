@@ -3,10 +3,13 @@
 // ============================================================
 
 const express = require("express");
+const http = require("http");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const path = require("path");
+const { initSocket } = require("./services/socketService");
+const { startMarketBroadcastTimer } = require("./services/marketDataService");
 
 dotenv.config({ path: path.resolve(__dirname, ".env") });
 
@@ -15,6 +18,7 @@ dotenv.config({ path: path.resolve(__dirname, ".env") });
 // ============================================================
 
 const app = express();
+let smtpVerifiedState = false;
 
 // ============================================================
 // MIDDLEWARE
@@ -182,12 +186,9 @@ app.get("/api/health", (req, res) => {
     server: "ok",
     database: dbStatus,
     email: process.env.EMAIL_USER ? "configured" : "not configured",
+    smtp: smtpVerifiedState ? "verified" : "unverified",
     environment: process.env.NODE_ENV || "development",
-    otpTerminalMode:
-      process.env.NODE_ENV !== "production" &&
-      process.env.SHOW_OTP_IN_TERMINAL === "true"
-        ? "enabled"
-        : "disabled",
+    otpTerminalMode: "disabled",
     devAuthBypass:
       process.env.NODE_ENV === "development" &&
       process.env.DEV_AUTH_BYPASS === "true"
@@ -280,8 +281,9 @@ mongoose
 
     // Verify SMTP configuration safely without logging secrets
     try {
-      await verifyTransporter();
+      smtpVerifiedState = await verifyTransporter();
     } catch (err) {
+      smtpVerifiedState = false;
       console.error("[Startup] SMTP verification failed:", err.message);
     }
 
@@ -309,7 +311,17 @@ mongoose
     const PORT =
       process.env.PORT || 5000;
 
-    app.listen(PORT, () => {
+    const server = http.createServer(app);
+    initSocket(server);
+
+    // Start background market broadcast timer (publishes updated market snapshots over Socket.IO)
+    try {
+      startMarketBroadcastTimer(60000);
+    } catch (err) {
+      console.warn("[Startup] Market broadcast timer warning:", err.message);
+    }
+
+    server.listen(PORT, () => {
 
       // -------------------------------------------------------
       // SAFE STARTUP BANNER
@@ -323,17 +335,12 @@ mongoose
       console.log(`Server:            running`);
       console.log(`Port:              ${PORT}`);
       console.log(`URL:               http://localhost:${PORT}`);
+      console.log(`WebSockets:        enabled (Socket.IO attached)`);
       console.log(`MongoDB:           connected`);
       console.log(`Email:             ${process.env.EMAIL_USER ? "configured" : "NOT configured"}`);
-      console.log(`SMTP:              verified`);
-      console.log(
-        `OTP terminal mode: ${
-          process.env.NODE_ENV !== "production" &&
-          process.env.SHOW_OTP_IN_TERMINAL === "true"
-            ? "ENABLED (development only)"
-            : "disabled"
-        }`
-      );
+      console.log(`SMTP:              ${smtpVerifiedState ? "verified" : "FAILED / UNVERIFIED"}`);
+      console.log(`Gemini AI:         ${process.env.GEMINI_API_KEY ? "configured" : "NOT configured"} (model: ${process.env.GEMINI_MODEL || "gemini-3.8-flash"})`);
+      console.log("OTP terminal mode: disabled");
       console.log(
         `Dev Login mode:    ${
           process.env.NODE_ENV === "development" &&
@@ -345,6 +352,14 @@ mongoose
       console.log(`Scheduler:         running`);
       console.log("=================================================");
       console.log("");
+    });
+
+    server.on("error", (err) => {
+      if (err.code === "EADDRINUSE") {
+        console.error(`[Fatal] Port ${PORT} is already in use by another process.`);
+        process.exit(1);
+      }
+      console.error("[Server Error]", err.message);
     });
   })
 

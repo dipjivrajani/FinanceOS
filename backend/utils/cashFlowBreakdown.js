@@ -216,6 +216,20 @@ async function calculateMonthlyCashFlowBreakdown({ userId, year, month }) {
       });
     }
 
+    // Support Fixed Deposit and One-Time investments when not recorded in transactions
+    const hasBuyTx = Array.isArray(inv.transactions) && inv.transactions.some(tx => (tx.type === "Buy" || tx.type === "Additional Investment") && isDateInPeriod(tx.date, targetYear, targetMonth));
+    if (!hasBuyTx && (inv.type === "Fixed Deposit" || inv.contributionType === "One Time" || inv.contributionType === "One-Time")) {
+      const invDate = inv.startDate || inv.createdAt;
+      if (isDateInPeriod(invDate, targetYear, targetMonth)) {
+        const amt = safeNum(inv.principalAmount || inv.amount);
+        if (amt > 0) {
+          actualInvestmentContributions += amt;
+          invPaidThisMonth += amt;
+          invPaidCount++;
+        }
+      }
+    }
+
     // Planned commitment for context (active in this month)
     if (inv.status === "Active") {
       plannedInvestmentsExpected += safeNum(inv.monthlyContribution || (inv.type === "SIP" ? inv.amount : 0));

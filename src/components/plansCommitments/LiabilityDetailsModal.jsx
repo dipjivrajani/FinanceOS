@@ -180,6 +180,11 @@ export default function LiabilityDetailsModal({ liability, onClose, onEdit }) {
           setPayPrincipal("");
           setPayInterest("");
         } catch (err) {
+          if (err?.code === "INSUFFICIENT_FUNDS") {
+            setActionModal(prev => ({ ...prev, isOpen: false }));
+            if (onClose) onClose();
+            return;
+          }
           setActionModal({
             isOpen: true,
             title: "Something went wrong",
@@ -254,6 +259,11 @@ export default function LiabilityDetailsModal({ liability, onClose, onEdit }) {
             }
           });
         } catch (err) {
+          if (err?.code === "INSUFFICIENT_FUNDS") {
+            setActionModal(prev => ({ ...prev, isOpen: false }));
+            if (onClose) onClose();
+            return;
+          }
           setActionModal({
             isOpen: true,
             title: "Something went wrong",

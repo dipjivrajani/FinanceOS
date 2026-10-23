@@ -162,6 +162,11 @@ export default function SIPContributionModal({ investment, onClose }) {
       const result = await addSIPContribution(investment.id || investment._id, payload);
 
       if (!result?.success) {
+        if (result?.code === "INSUFFICIENT_FUNDS") {
+          setIsSubmitting(false);
+          onClose();
+          return;
+        }
         setErrorModalMsg(result?.message || "Unable to record contribution.");
         setErrorModalOpen(true);
         setIsSubmitting(false);
@@ -173,6 +178,11 @@ export default function SIPContributionModal({ investment, onClose }) {
       setIsSubmitting(false);
     } catch (err) {
       console.error(err);
+      if (err?.code === "INSUFFICIENT_FUNDS") {
+        setIsSubmitting(false);
+        onClose();
+        return;
+      }
       setErrorModalMsg(err.message || "An unexpected error occurred.");
       setErrorModalOpen(true);
       setIsSubmitting(false);

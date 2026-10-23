@@ -211,6 +211,11 @@ export default function InsuranceDetailsModal({ policy, onClose, onEdit }) {
           });
           setPayNote("");
         } catch (err) {
+          if (err?.code === "INSUFFICIENT_FUNDS") {
+            setActionModal(prev => ({ ...prev, isOpen: false }));
+            if (onClose) onClose();
+            return;
+          }
           setActionModal({
             isOpen: true,
             title: "Something went wrong",

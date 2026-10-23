@@ -968,6 +968,10 @@ function PlansCommitments() {
         onConfirm: () => setActionModal(prev => ({ ...prev, isOpen: false })),
       });
     } catch (err) {
+      if (err?.code === "INSUFFICIENT_FUNDS") {
+        closePaymentModal();
+        return;
+      }
       setPaymentError(err.message || "Failed to record payment.");
     }
 
@@ -1583,6 +1587,18 @@ function PlansCommitments() {
 
 
             <div className="flex items-center gap-3">
+              {latestAISuggestion && (
+                <button
+                  type="button"
+                  onClick={() => setIsAISuggestionModalOpen(true)}
+                  className="hidden md:flex shrink-0 items-center gap-1.5 rounded-xl border border-[#dfe8dc] bg-[#f7fbf5] px-3.5 py-3 text-sm font-semibold text-[#315c46] transition hover:bg-[#ebf5e7] shadow-xs cursor-pointer"
+                  title="Open latest saved financial analysis"
+                >
+                  <FiZap className="text-[#315c46]" size={15} />
+                  <span>View Analysis</span>
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={handleGetAISuggestion}
@@ -1591,7 +1607,7 @@ function PlansCommitments() {
                 title="Run Live AI Financial Analysis"
               >
                 <FiZap className={`text-base ${aiLoading ? "animate-spin text-amber-600" : "text-[#315c46]"}`} />
-                <span>{aiLoading ? (aiLoadingMessage || "Analyzing Situation...") : "Get AI Suggestion"}</span>
+                <span>{aiLoading ? (aiLoadingMessage || "Analyzing Situation...") : (latestAISuggestion ? "Re-analyze" : "Get AI Suggestion")}</span>
               </button>
 
               <button
@@ -1610,6 +1626,26 @@ function PlansCommitments() {
             </div>
 
           </div>
+
+          {aiError && (
+            <div className="mt-4 flex items-start justify-between gap-3 rounded-2xl border border-rose-200 bg-rose-50/80 p-4 text-xs text-rose-900 shadow-xs">
+              <div className="flex items-start gap-2.5">
+                <FiAlertTriangle className="mt-0.5 text-rose-600 shrink-0" size={16} />
+                <div>
+                  <p className="font-bold text-rose-900">AI Financial Analysis Notice</p>
+                  <p className="mt-0.5 text-rose-700">{aiError}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleGetAISuggestion}
+                disabled={aiLoading}
+                className="shrink-0 rounded-xl border border-rose-300 bg-white px-3 py-1.5 text-xs font-semibold text-rose-800 transition hover:bg-rose-100 disabled:opacity-50 cursor-pointer"
+              >
+                Retry Analysis
+              </button>
+            </div>
+          )}
 
 
           {/* ==================================================

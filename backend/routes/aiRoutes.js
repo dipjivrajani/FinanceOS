@@ -1,5 +1,5 @@
 // ============================================================
-// FINANCEOS - AI ADVISER ROUTES
+// FINANCEOS - AI ADVISER & MARKET DATA ROUTES
 // ============================================================
 
 const express = require("express");
@@ -16,5 +16,11 @@ router.get("/latest", authMiddleware, aiAdviserController.getLatestSuggestion);
 
 // Get past recommendation history
 router.get("/history", authMiddleware, aiAdviserController.getSuggestionHistory);
+
+// Get current verified market benchmarks (Gold, Silver, Equities/Nifty, Sensex, Bank FDs, Govt Schemes)
+router.get("/market-data", authMiddleware, aiAdviserController.getMarketData);
+
+// Force refresh verified market benchmarks from live providers
+router.post("/market-data/refresh", authMiddleware, aiAdviserController.refreshMarketData);
 
 module.exports = router;

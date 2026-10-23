@@ -251,6 +251,160 @@ const aiSuggestionSchema = new mongoose.Schema(
       default: "Invest at your own risk — market prices and conditions can change, and values may increase or decrease.",
     },
 
+    // What Should I Do With My Money? (Friendly 3-Section Format)
+    yourSituation: {
+      text: { type: String, default: "" },
+      availableAmount: { type: Number, default: 0 },
+      emergencyBufferText: { type: String, default: "" },
+      summary: { type: String, default: "" },
+    },
+
+    yourOptions: [
+      {
+        option: { type: String, required: true },
+        category: { type: String, default: "General" },
+        whyFits: { type: String, default: "" },
+        risks: { type: String, default: "" },
+        suitability: { type: String, default: "Consider" },
+        amount: { type: Number, default: 0 },
+        officialLink: { type: String, default: "" },
+      },
+    ],
+
+    yourNextStep: {
+      action: { type: String, default: "" },
+      why: { type: String, default: "" },
+      risks: { type: String, default: "" },
+      missingInfo: { type: String, default: "" },
+      officialLink: { type: String, default: "" },
+    },
+
+    // Terminology Explanations (SIP, NAV, FD, IPO, GMP, EMI, Mutual Fund)
+    termsExplained: [
+      {
+        term: { type: String },
+        definition: { type: String },
+      },
+    ],
+
+    // Stocks to Research
+    stocksForResearch: [mongoose.Schema.Types.Mixed],
+
+    // 1. Investment Readiness Evaluation (Section 5)
+    investmentReadiness: {
+      isReadyToInvest: { type: Boolean, default: true },
+      status: { type: String, default: "READY" }, // READY | DEBT_FIRST | EMERGENCY_RESERVE_FIRST | DEFICIT_RECOVERY | HOLD_LIQUIDITY
+      priorityRecommendation: { type: String, default: "INVEST" },
+      passedChecksCount: { type: Number, default: 0 },
+      totalChecksCount: { type: Number, default: 9 },
+      checks: [
+        {
+          id: { type: String },
+          title: { type: String },
+          passed: { type: Boolean },
+          details: { type: String },
+        },
+      ],
+      unresolvedConcerns: [{ type: String, trim: true }],
+    },
+
+    // 2. Loan Repayment vs Investment vs FD Analysis (Section 6.A)
+    loanVsInvestmentAnalysis: {
+      hasActiveLoans: { type: Boolean, default: false },
+      hasMaturingInvestments: { type: Boolean, default: false },
+      loanSummary: {
+        principal: { type: Number, default: 0 },
+        interestRate: { type: Number, default: 0 },
+        monthlyEMI: { type: Number, default: 0 },
+        remainingTenureMonths: { type: Number, default: 0 },
+      },
+      waitingInterestCost: { type: Number, default: 0 },
+      grossInterestSaved: { type: Number, default: 0 },
+      prepaymentPenalty: { type: Number, default: 0 },
+      netInterestSaved: { type: Number, default: 0 },
+      tenureMonthsSaved: { type: Number, default: 0 },
+      recommendation: { type: String, default: "" },
+      rationale: { type: String, default: "" },
+    },
+
+    // 3. Maturity-to-Action Plan (Section 6.B)
+    maturityToAction: {
+      hasMaturingInvestment: { type: Boolean, default: false },
+      hasMaturingItems: { type: Boolean, default: false },
+      maturingItems: [
+        {
+          id: { type: String },
+          name: { type: String },
+          type: { type: String },
+          maturityDateFormatted: { type: String },
+          daysRemaining: { type: Number },
+          amount: { type: Number },
+          isConfirmedAmount: { type: Boolean },
+        },
+      ],
+      primaryItem: {
+        name: { type: String, default: "" },
+        daysRemaining: { type: Number, default: 0 },
+        amount: { type: Number, default: 0 },
+        maturityDateFormatted: { type: String, default: "" },
+      },
+      recommendation: { type: String, default: "" },
+      why: { type: String, default: "" },
+    },
+
+    // 4. Verified Bank FD & Deposit Terms (Section 6.D)
+    bankFDComparison: {
+      benchmarkRange: { type: String, default: "6.80% - 7.60%" },
+      dicgcInsuranceLimit: { type: Number, default: 500000 },
+      taxation: { type: String, default: "Interest taxable as per slab rate; TDS applies above ₹40,000/yr." },
+      institutions: [
+        {
+          bank: { type: String },
+          tenure: { type: String },
+          generalRate: { type: String },
+          seniorRate: { type: String },
+          specialTenureScheme: { type: String },
+          prematurePenalty: { type: String },
+          dicgcInsured: { type: Boolean, default: true },
+          sourceUrl: { type: String },
+        },
+      ],
+      recommendedTenure: { type: String, default: "1 Year to 18 Months" },
+      recommendedBank: { type: String, default: "SBI / HDFC / ICICI" },
+      rationale: { type: String, default: "" },
+    },
+
+    // 5. Actionable Comparison Matrix (Section 6.E)
+    comparisonMatrix: [
+      {
+        id: { type: String },
+        choice: { type: String },
+        purpose: { type: String },
+        whyToConsider: { type: String },
+        mainTradeOff: { type: String },
+        rank: { type: Number },
+        suitability: { type: String },
+        risk: { type: String },
+        liquidity: { type: String },
+        timeHorizon: { type: String },
+        illustrativeAllocation: { type: Number, default: 0 },
+      },
+    ],
+
+    // 6. Recommended Investment Categories (Section 4)
+    recommendedCategories: [
+      {
+        category: { type: String },
+        suitability: { type: String },
+        rationale: { type: String },
+        timeHorizon: { type: String },
+        riskLevel: { type: String },
+        liquidity: { type: String },
+        taxImplications: { type: String },
+        alternatives: { type: String },
+      },
+    ],
+
     // External verified multi-asset market context
     externalContext: {
       // Gold

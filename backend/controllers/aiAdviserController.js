@@ -1,9 +1,10 @@
 // ============================================================
 // FINANCEOS - AI ADVISER CONTROLLER
-// Controller handling AI suggestion generation and retrieval
+// Controller handling AI suggestion generation, retrieval & market data
 // ============================================================
 
 const aiAdviserService = require("../services/aiAdviserService");
+const { getLiveMarketBenchmarks } = require("../services/marketDataService");
 const Activity = require("../models/Activity");
 const User = require("../models/User");
 
@@ -28,8 +29,8 @@ const logActivity = async (userId, description) => {
 // POST /api/ai/generate
 // ============================================================
 
-// Set to track active in-flight generations per user
-const activeGenerations = new Set();
+// Map to track active in-flight generations per user with timeout
+const activeGenerations = new Map();
 
 const generateSuggestion = async (req, res) => {
   const userId = req.user?.id;
@@ -40,15 +41,16 @@ const generateSuggestion = async (req, res) => {
     });
   }
 
-  // Concurrency guard: prevent duplicate simultaneous generation requests
-  if (activeGenerations.has(userId)) {
+  // Concurrency guard: prevent duplicate simultaneous generation requests (with 45s safety timeout)
+  const existingStartTime = activeGenerations.get(userId);
+  if (existingStartTime && Date.now() - existingStartTime < 45000) {
     return res.status(429).json({
       success: false,
       message: "An AI recommendation is already being generated for your account. Please wait.",
     });
   }
 
-  activeGenerations.add(userId);
+  activeGenerations.set(userId, Date.now());
 
   try {
     const { context = "plans_commitments", targetItem = null, selectedMonth = "" } = req.body || {};
@@ -71,6 +73,25 @@ const generateSuggestion = async (req, res) => {
     });
   } catch (error) {
     console.error("Generate AI Suggestion Error:", error);
+
+    if (error.code === "GEMINI_API_KEY_MISSING") {
+      return res.status(400).json({
+        success: false,
+        code: "GEMINI_API_KEY_MISSING",
+        message: error.message || "GEMINI_API_KEY is missing in backend/.env. Please configure a valid key to generate AI recommendations.",
+        canRetry: true,
+      });
+    }
+
+    if (error.code === "GEMINI_API_ERROR") {
+      return res.status(503).json({
+        success: false,
+        code: "GEMINI_API_ERROR",
+        message: error.message || "Google Gemini API encountered an error. Please retry in a few moments.",
+        canRetry: true,
+      });
+    }
+
     const isDbError =
       error.name === "MongoError" ||
       error.name === "MongooseError" ||
@@ -78,9 +99,11 @@ const generateSuggestion = async (req, res) => {
 
     return res.status(500).json({
       success: false,
+      code: "AI_GENERATION_FAILED",
       message: isDbError
-        ? "Unable to refresh your financial data. Please try again."
+        ? "Unable to access your financial records in MongoDB. Please try again."
         : error.message || "Failed to generate AI recommendation.",
+      canRetry: true,
     });
   } finally {
     activeGenerations.delete(userId);
@@ -95,7 +118,7 @@ const generateSuggestion = async (req, res) => {
 
 const getLatestSuggestion = async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user?.id;
     if (!userId) {
       return res.status(401).json({
         success: false,
@@ -125,7 +148,7 @@ const getLatestSuggestion = async (req, res) => {
 
 const getSuggestionHistory = async (req, res) => {
   try {
-    const userId = req.user.id;
+    const userId = req.user?.id;
     if (!userId) {
       return res.status(401).json({
         success: false,
@@ -149,8 +172,53 @@ const getSuggestionHistory = async (req, res) => {
   }
 };
 
+// ============================================================
+// GET VERIFIED MARKET BENCHMARKS
+// GET /api/ai/market-data
+// ============================================================
+
+const getMarketData = async (req, res) => {
+  try {
+    const market = await getLiveMarketBenchmarks({ forceFresh: false });
+    return res.status(200).json({
+      success: true,
+      data: market,
+    });
+  } catch (error) {
+    console.error("Get Market Data Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch current market benchmarks.",
+    });
+  }
+};
+
+// ============================================================
+// REFRESH MARKET DATA
+// POST /api/ai/market-data/refresh
+// ============================================================
+
+const refreshMarketData = async (req, res) => {
+  try {
+    const market = await getLiveMarketBenchmarks({ forceFresh: true });
+    return res.status(200).json({
+      success: true,
+      message: "Market data refreshed successfully.",
+      data: market,
+    });
+  } catch (error) {
+    console.error("Refresh Market Data Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to refresh market data.",
+    });
+  }
+};
+
 module.exports = {
   generateSuggestion,
   getLatestSuggestion,
   getSuggestionHistory,
+  getMarketData,
+  refreshMarketData,
 };

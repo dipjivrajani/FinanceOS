@@ -143,94 +143,132 @@ const deleteInsurance = async (req, res) => {
 const { isItemActiveInMonth, parseSelectedMonth, isDateInMonth, getMonthName } = require("../utils/monthLifecycle");
 const { calculateDueDateForMonth, formatDateISO } = require("../utils/dueDateSchedule");
 const MonthlyFinance = require("../models/MonthlyFinance");
+const {
+  validateSufficientFunds,
+  withUserPaymentLock,
+  handleFundsError,
+} = require("../utils/fundValidationService");
 
 const addInsurancePayment = async (req, res) => {
   try {
     const userId = req.user?.id || req.user?._id;
-    const insurance = await Insurance.findOne({ _id: req.params.id, user: userId });
 
-    if (!insurance) {
-      return res.status(404).json({ success: false, message: "Insurance policy not found." });
-    }
+    const result = await withUserPaymentLock(userId, async () => {
+      const insurance = await Insurance.findOne({ _id: req.params.id, user: userId });
 
-    const {
-      amount,
-      paidDate,
-      status,
-      paymentSource,
-      note,
-      selectedMonth: reqSelectedMonth
-    } = req.body;
-    
-    if (!amount || amount <= 0) {
-      return res.status(400).json({ success: false, message: "Valid payment amount is required." });
-    }
+      if (!insurance) {
+        const notFoundErr = new Error("Insurance policy not found.");
+        notFoundErr.statusCode = 404;
+        throw notFoundErr;
+      }
 
-    // Determine target working month context
-    const monthCtx = parseSelectedMonth(reqSelectedMonth || (paidDate ? String(paidDate).slice(0, 7) : null));
-    const targetYear = monthCtx.year;
-    const targetMonth = monthCtx.month;
-    const formattedMonth = `${getMonthName(targetMonth)} ${targetYear}`;
+      const {
+        amount,
+        paidDate,
+        status,
+        paymentSource,
+        note,
+        selectedMonth: reqSelectedMonth
+      } = req.body;
+      
+      const paymentAmount = Number(amount);
+      if (!Number.isFinite(paymentAmount) || paymentAmount <= 0) {
+        const err = new Error("Valid payment amount is required.");
+        err.code = "INVALID_AMOUNT";
+        err.statusCode = 400;
+        throw err;
+      }
 
-    // 1. Lifecycle check: Insurance must have started on or before target month
-    if (!isItemActiveInMonth(insurance, targetYear, targetMonth)) {
-      const insStart = new Date(insurance.startDate || insurance.createdAt);
-      const startMonthName = getMonthName(insStart.getMonth() + 1);
-      return res.status(400).json({
-        success: false,
-        message: `Cannot record payment in ${formattedMonth}. This policy starts in ${startMonthName} ${insStart.getFullYear()}.`,
-      });
-    }
+      // Determine target working month context
+      const monthCtx = parseSelectedMonth(reqSelectedMonth || (paidDate ? String(paidDate).slice(0, 7) : null));
+      const targetYear = monthCtx.year;
+      const targetMonth = monthCtx.month;
+      const formattedMonth = `${getMonthName(targetMonth)} ${targetYear}`;
 
-    // --------------------------------------------------------
-    // DERIVE DUE DATE FROM STORED SCHEDULE (server-side only)
-    // --------------------------------------------------------
-    const storedDueDay = insurance.premiumDueDay
-      || (insurance.startDate ? new Date(insurance.startDate).getDate() : null)
-      || 1; // fallback
+      // 1. Lifecycle check: Insurance must have started on or before target month
+      if (!isItemActiveInMonth(insurance, targetYear, targetMonth)) {
+        const insStart = new Date(insurance.startDate || insurance.createdAt);
+        const startMonthName = getMonthName(insStart.getMonth() + 1);
+        const err = new Error(`Cannot record payment in ${formattedMonth}. This policy starts in ${startMonthName} ${insStart.getFullYear()}.`);
+        err.statusCode = 400;
+        throw err;
+      }
 
-    const effectiveDueDate = calculateDueDateForMonth(storedDueDay, targetYear, targetMonth);
-
-    const effectivePaidDate = status === "Paid" || !status
-      ? (paidDate ? new Date(paidDate) : new Date())
-      : null;
-
-    // Validate paid date belongs to selected month
-    if (reqSelectedMonth && effectivePaidDate) {
-      if (!isDateInMonth(effectivePaidDate, targetYear, targetMonth)) {
-        return res.status(400).json({
-          success: false,
-          message: `Payment date must be within the selected month: ${formattedMonth}.`,
+      // Check sufficient funds if marking as Paid
+      if (status === "Paid" || !status) {
+        await validateSufficientFunds({
+          userId,
+          year: targetYear,
+          month: targetMonth,
+          requestedAmount: paymentAmount,
         });
       }
-    }
 
-    const payment = {
-      amount: Number(amount),
-      dueDate: effectiveDueDate,
-      paidDate: effectivePaidDate,
-      date: effectivePaidDate || effectiveDueDate,
-      status: status || "Paid",
-      paymentSource: paymentSource || { method: "Cash" },
-      note: note || "",
-    };
+      // --------------------------------------------------------
+      // DERIVE DUE DATE FROM STORED SCHEDULE (server-side only)
+      // --------------------------------------------------------
+      const storedDueDay = insurance.premiumDueDay
+        || (insurance.startDate ? new Date(insurance.startDate).getDate() : null)
+        || 1; // fallback
 
-    if (!Array.isArray(insurance.payments)) {
-      insurance.payments = [];
-    }
+      const effectiveDueDate = calculateDueDateForMonth(storedDueDay, targetYear, targetMonth);
 
-    insurance.payments.push(payment);
-    await insurance.save();
+      const effectivePaidDate = status === "Paid" || !status
+        ? (paidDate ? new Date(paidDate) : new Date())
+        : null;
+
+      // Validate paid date belongs to selected month
+      if (reqSelectedMonth && effectivePaidDate) {
+        if (!isDateInMonth(effectivePaidDate, targetYear, targetMonth)) {
+          const err = new Error(`Payment date must be within the selected month: ${formattedMonth}.`);
+          err.statusCode = 400;
+          throw err;
+        }
+      }
+
+      const payment = {
+        amount: paymentAmount,
+        dueDate: effectiveDueDate,
+        paidDate: effectivePaidDate,
+        date: effectivePaidDate || effectiveDueDate,
+        status: status || "Paid",
+        paymentSource: paymentSource || { method: "Cash" },
+        note: note || "",
+      };
+
+      if (!Array.isArray(insurance.payments)) {
+        insurance.payments = [];
+      }
+
+      insurance.payments.push(payment);
+      await insurance.save();
+
+      return {
+        insurance,
+        payment,
+        paymentAmount,
+        formattedMonth,
+        iso: monthCtx.iso,
+        effectiveDueDate,
+      };
+    });
 
     res.status(201).json({
       success: true,
-      message: `Premium payment of ₹${Number(amount).toLocaleString("en-IN")} recorded for ${formattedMonth}.`,
-      insurance,
-      payment,
-      selectedMonth: monthCtx.iso,
-      derivedDueDate: formatDateISO(effectiveDueDate),
+      message: `Premium payment of ₹${result.paymentAmount.toLocaleString("en-IN")} recorded for ${result.formattedMonth}.`,
+      insurance: result.insurance,
+      payment: result.payment,
+      selectedMonth: result.iso,
+      derivedDueDate: formatDateISO(result.effectiveDueDate),
     });
   } catch (error) {
+    if (handleFundsError(res, error)) return;
+    if (error.statusCode === 404) {
+      return res.status(404).json({ success: false, message: error.message });
+    }
+    if (error.statusCode === 400) {
+      return res.status(400).json({ success: false, message: error.message });
+    }
     console.error("Add Insurance Payment:", error);
     res.status(500).json({ success: false, message: "Server Error", error: error.message });
   }

@@ -1,7 +1,9 @@
 import { getAuthToken, getAuthUser, clearAuthSession, onAccountDeleted } from "../utils/authStorage.js";
 import CenteredModal from "../components/common/CenteredModal.jsx";
 import { useMemo, useState, useEffect, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import FinanceContext from "./FinanceContext.js";
+import { io } from "socket.io-client";
 import { isItemActiveInMonth, parseSelectedMonth, isDateInMonth } from "../utils/monthLifecycle.js";
 import { deriveCashFlowBreakdown, isDateInPeriod } from "../utils/cashFlowBreakdown.js";
 
@@ -233,6 +235,58 @@ function FinanceProvider({ children }) {
   const [aiLoadingMessage, setAiLoadingMessage] = useState("Analyzing latest data...");
   const [aiError, setAiError] = useState(null);
 
+  // Live Market Data State
+  const [marketData, setMarketData] = useState(null);
+  const [marketDataLoading, setMarketDataLoading] = useState(false);
+  const [marketDataError, setMarketDataError] = useState(null);
+  const [socketConnected, setSocketConnected] = useState(false);
+  const [marketDataLastReceived, setMarketDataLastReceived] = useState(null);
+
+  // Real-time Market Data Streaming via Socket.IO
+  useEffect(() => {
+    let socket = null;
+    try {
+      const token = getAuthToken();
+      socket = io("http://localhost:5000", {
+        transports: ["websocket", "polling"],
+        auth: { token },
+        reconnection: true,
+        reconnectionAttempts: 15,
+        reconnectionDelay: 1500,
+        reconnectionDelayMax: 5000,
+        timeout: 10000,
+      });
+
+      socket.on("connect", () => {
+        setSocketConnected(true);
+      });
+
+      socket.on("disconnect", () => {
+        setSocketConnected(false);
+      });
+
+      socket.on("connect_error", () => {
+        setSocketConnected(false);
+      });
+
+      // Genuine real-time market snapshot received from backend service
+      socket.on("market:update", (updatedMarket) => {
+        if (updatedMarket && typeof updatedMarket === "object") {
+          setMarketData(updatedMarket);
+          setMarketDataLastReceived(new Date());
+        }
+      });
+    } catch (err) {
+      console.warn("Socket.IO client initialization warning:", err);
+    }
+
+    return () => {
+      if (socket) {
+        socket.disconnect();
+      }
+    };
+  }, []);
+
   // Account Deleted Modal State & Invalidation Listener
   const [accountDeletedModalOpen, setAccountDeletedModalOpen] = useState(false);
 
@@ -279,6 +333,56 @@ function FinanceProvider({ children }) {
     clearAuthSession();
     window.location.href = "/signin";
   };
+
+  const navigate = useNavigate();
+
+  // Insufficient Funds Global Modal State
+  const [insufficientFundsModal, setInsufficientFundsModal] = useState({
+    isOpen: false,
+    availableAmount: 0,
+    requestedAmount: 0,
+    message: "",
+  });
+
+  const formatINR = useCallback((val) => {
+    const num = Math.round(Number(val) || 0);
+    if (num < 0) return `-₹${Math.abs(num).toLocaleString("en-IN")}`;
+    return `₹${num.toLocaleString("en-IN")}`;
+  }, []);
+
+  const showInsufficientFundsModal = useCallback(
+    ({ availableAmount: passedAvailable, requestedAmount: passedRequested, message: passedMessage } = {}) => {
+      const avail = Number.isFinite(Number(passedAvailable)) ? Number(passedAvailable) : 0;
+      const req = Number.isFinite(Number(passedRequested)) ? Number(passedRequested) : 0;
+      const msg =
+        passedMessage ||
+        `You don't have sufficient funds available to make this payment. Your available balance is ${formatINR(
+          avail
+        )}, but the requested amount is ${formatINR(req)}.`;
+
+      setInsufficientFundsModal({
+        isOpen: true,
+        availableAmount: avail,
+        requestedAmount: req,
+        message: msg,
+      });
+    },
+    [formatINR]
+  );
+
+  const handleInsufficientFundsClose = useCallback(() => {
+    setInsufficientFundsModal({
+      isOpen: false,
+      availableAmount: 0,
+      requestedAmount: 0,
+      message: "",
+    });
+    if (typeof navigate === "function") {
+      navigate("/dashboard");
+    } else {
+      window.location.href = "/dashboard";
+    }
+  }, [navigate]);
 
   // Selected Dashboard View Month State (?month=YYYY-MM)
   const [selectedMonth, setSelectedMonthState] = useState(() => {
@@ -1719,6 +1823,18 @@ function FinanceProvider({ children }) {
 
     const data = await response.json();
     if (!response.ok || !data.success) {
+      if (data.code === "INSUFFICIENT_FUNDS") {
+        showInsufficientFundsModal({
+          availableAmount: data.availableAmount,
+          requestedAmount: data.requestedAmount,
+          message: data.message,
+        });
+        const err = new Error(data.message || "Insufficient funds available.");
+        err.code = "INSUFFICIENT_FUNDS";
+        err.availableAmount = data.availableAmount;
+        err.requestedAmount = data.requestedAmount;
+        throw err;
+      }
       throw new Error(data.message || "Failed to save saving goal.");
     }
 
@@ -1828,6 +1944,25 @@ function FinanceProvider({ children }) {
   const addGoalContribution = async (id, contributionData) => {
     const token = getAuthToken();
 
+    const targetMonthIso = contributionData.selectedMonth || selectedMonth || activeWorkingPeriod.iso;
+    const reqAmount = Number(contributionData.amount);
+
+    if (targetMonthIso === activeWorkingPeriod.iso && Number.isFinite(reqAmount) && reqAmount > availableToAllocate) {
+      showInsufficientFundsModal({
+        availableAmount: availableToAllocate,
+        requestedAmount: reqAmount,
+      });
+      const err = new Error(
+        `You don't have sufficient funds available to make this payment. Your available balance is ${formatINR(
+          availableToAllocate
+        )}, but the requested amount is ${formatINR(reqAmount)}.`
+      );
+      err.code = "INSUFFICIENT_FUNDS";
+      err.availableAmount = availableToAllocate;
+      err.requestedAmount = reqAmount;
+      throw err;
+    }
+
     const response = await fetch(
       `http://localhost:5000/api/saving-goals/${id}/contribution`,
       {
@@ -1839,7 +1974,7 @@ function FinanceProvider({ children }) {
         body: JSON.stringify({
           amount: contributionData.amount,
           date: contributionData.date,
-          selectedMonth: contributionData.selectedMonth || selectedMonth || activeWorkingPeriod.iso,
+          selectedMonth: targetMonthIso,
           source: contributionData.source || "Monthly Savings",
           note: contributionData.note || "",
           paymentDetails: contributionData.paymentDetails || {},
@@ -1850,6 +1985,18 @@ function FinanceProvider({ children }) {
 
     const data = await response.json();
     if (!response.ok || !data.success) {
+      if (data.code === "INSUFFICIENT_FUNDS") {
+        showInsufficientFundsModal({
+          availableAmount: data.availableAmount,
+          requestedAmount: data.requestedAmount,
+          message: data.message,
+        });
+        const err = new Error(data.message || "Insufficient funds available.");
+        err.code = "INSUFFICIENT_FUNDS";
+        err.availableAmount = data.availableAmount;
+        err.requestedAmount = data.requestedAmount;
+        throw err;
+      }
       throw new Error(data.message || "Failed to add contribution.");
     }
 
@@ -1891,6 +2038,18 @@ function FinanceProvider({ children }) {
 
     const data = await response.json();
     if (!response.ok || !data.success) {
+      if (data.code === "INSUFFICIENT_FUNDS") {
+        showInsufficientFundsModal({
+          availableAmount: data.availableAmount,
+          requestedAmount: data.requestedAmount,
+          message: data.message,
+        });
+        const err = new Error(data.message || "Insufficient funds available.");
+        err.code = "INSUFFICIENT_FUNDS";
+        err.availableAmount = data.availableAmount;
+        err.requestedAmount = data.requestedAmount;
+        throw err;
+      }
       throw new Error(data.message || "Failed to update contribution.");
     }
 
@@ -2034,6 +2193,26 @@ function FinanceProvider({ children }) {
       }
 
       const isFD = String(investment.type || "").trim().toLowerCase() === "fixed deposit";
+      const isOneTime = String(investment.contributionType || "").toLowerCase() === "one time" || String(investment.contributionType || "").toLowerCase() === "one-time";
+      const isStocks = String(investment.type || "").trim().toLowerCase() === "stocks";
+      const isGold = String(investment.type || "").trim().toLowerCase() === "gold";
+      const consumesFunds = isFD || isOneTime || isStocks || isGold || investment.consumeAvailableFunds === true;
+
+      if (consumesFunds && amount > availableToAllocate) {
+        showInsufficientFundsModal({
+          availableAmount: availableToAllocate,
+          requestedAmount: amount,
+        });
+        return {
+          success: false,
+          code: "INSUFFICIENT_FUNDS",
+          availableAmount: availableToAllocate,
+          requestedAmount: amount,
+          message: `You don't have sufficient funds available to make this payment. Your available balance is ${formatINR(
+            availableToAllocate
+          )}, but the requested amount is ${formatINR(amount)}.`,
+        };
+      }
 
       const investmentData = {
         name: investment.name,
@@ -2106,6 +2285,18 @@ function FinanceProvider({ children }) {
       const data = await response.json();
 
       if (!response.ok || !data.success) {
+        if (data.code === "INSUFFICIENT_FUNDS") {
+          showInsufficientFundsModal({
+            availableAmount: data.availableAmount,
+            requestedAmount: data.requestedAmount,
+            message: data.message,
+          });
+          return {
+            success: false,
+            code: "INSUFFICIENT_FUNDS",
+            ...data,
+          };
+        }
         throw new Error(data.message || "Failed to save investment.");
       }
 
@@ -2190,9 +2381,28 @@ function FinanceProvider({ children }) {
         };
       }
 
+      const targetMonthIso = contributionData.selectedMonth || selectedMonth || activeWorkingPeriod.iso;
+      const amount = Number(contributionData.amount);
+
+      if (targetMonthIso === activeWorkingPeriod.iso && Number.isFinite(amount) && amount > availableToAllocate) {
+        showInsufficientFundsModal({
+          availableAmount: availableToAllocate,
+          requestedAmount: amount,
+        });
+        return {
+          success: false,
+          code: "INSUFFICIENT_FUNDS",
+          availableAmount: availableToAllocate,
+          requestedAmount: amount,
+          message: `You don't have sufficient funds available to make this payment. Your available balance is ${formatINR(
+            availableToAllocate
+          )}, but the requested amount is ${formatINR(amount)}.`,
+        };
+      }
+
       const payload = {
         ...contributionData,
-        selectedMonth: contributionData.selectedMonth || selectedMonth || activeWorkingPeriod.iso,
+        selectedMonth: targetMonthIso,
       };
 
       const response = await fetch(
@@ -2210,6 +2420,18 @@ function FinanceProvider({ children }) {
       const data = await response.json();
 
       if (!response.ok || !data.success) {
+        if (data.code === "INSUFFICIENT_FUNDS") {
+          showInsufficientFundsModal({
+            availableAmount: data.availableAmount,
+            requestedAmount: data.requestedAmount,
+            message: data.message,
+          });
+          return {
+            success: false,
+            code: "INSUFFICIENT_FUNDS",
+            ...data,
+          };
+        }
         throw new Error(data.message || "Failed to add SIP contribution.");
       }
 
@@ -2262,6 +2484,18 @@ function FinanceProvider({ children }) {
       const data = await response.json();
 
       if (!response.ok || !data.success) {
+        if (data.code === "INSUFFICIENT_FUNDS") {
+          showInsufficientFundsModal({
+            availableAmount: data.availableAmount,
+            requestedAmount: data.requestedAmount,
+            message: data.message,
+          });
+          return {
+            success: false,
+            code: "INSUFFICIENT_FUNDS",
+            ...data,
+          };
+        }
         throw new Error(data.message || "Failed to update SIP contribution.");
       }
 
@@ -2279,6 +2513,73 @@ function FinanceProvider({ children }) {
         success: false,
         message: error.message || "Failed to update SIP contribution.",
       };
+    }
+  };
+
+  const addInvestmentTransaction = async (investmentId, transactionData = {}) => {
+    try {
+      const token = getAuthToken();
+      if (!token) {
+        return { success: false, message: "Authentication token not found." };
+      }
+
+      const amount = Number(transactionData.amount);
+      const type = transactionData.type || "Buy";
+      const isOutflow = type === "Buy" || type === "Additional Investment";
+
+      if (isOutflow && Number.isFinite(amount) && amount > availableToAllocate) {
+        showInsufficientFundsModal({
+          availableAmount: availableToAllocate,
+          requestedAmount: amount,
+        });
+        return {
+          success: false,
+          code: "INSUFFICIENT_FUNDS",
+          availableAmount: availableToAllocate,
+          requestedAmount: amount,
+          message: `You don't have sufficient funds available to make this payment. Your available balance is ${formatINR(
+            availableToAllocate
+          )}, but the requested amount is ${formatINR(amount)}.`,
+        };
+      }
+
+      const response = await fetch(`http://localhost:5000/api/investments/${investmentId}/transactions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(transactionData),
+      });
+
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        if (data.code === "INSUFFICIENT_FUNDS") {
+          showInsufficientFundsModal({
+            availableAmount: data.availableAmount,
+            requestedAmount: data.requestedAmount,
+            message: data.message,
+          });
+          return {
+            success: false,
+            code: "INSUFFICIENT_FUNDS",
+            ...data,
+          };
+        }
+        throw new Error(data.message || "Failed to add transaction.");
+      }
+
+      await loadInvestments();
+      await loadMonthFinance(activeWorkingPeriod.year, activeWorkingPeriod.month);
+
+      return {
+        success: true,
+        investment: data.investment,
+        message: data.message || "Transaction recorded successfully.",
+      };
+    } catch (error) {
+      console.error("Add Investment Transaction:", error);
+      return { success: false, message: error.message || "Failed to add transaction." };
     }
   };
 
@@ -2833,9 +3134,28 @@ function FinanceProvider({ children }) {
   const addInsurancePayment = async (id, paymentData) => {
     const token = getAuthToken();
 
+    const targetMonthIso = (typeof paymentData === "object" && paymentData.selectedMonth) || selectedMonth || activeWorkingPeriod.iso;
+    const reqAmount = Number(typeof paymentData === "object" ? paymentData.amount : paymentData);
+
+    if (targetMonthIso === activeWorkingPeriod.iso && Number.isFinite(reqAmount) && reqAmount > availableToAllocate) {
+      showInsufficientFundsModal({
+        availableAmount: availableToAllocate,
+        requestedAmount: reqAmount,
+      });
+      const err = new Error(
+        `You don't have sufficient funds available to make this payment. Your available balance is ${formatINR(
+          availableToAllocate
+        )}, but the requested amount is ${formatINR(reqAmount)}.`
+      );
+      err.code = "INSUFFICIENT_FUNDS";
+      err.availableAmount = availableToAllocate;
+      err.requestedAmount = reqAmount;
+      throw err;
+    }
+
     const payload = {
       ...(typeof paymentData === "object" ? paymentData : { amount: paymentData }),
-      selectedMonth: (typeof paymentData === "object" && paymentData.selectedMonth) || selectedMonth || activeWorkingPeriod.iso,
+      selectedMonth: targetMonthIso,
     };
 
     const response = await fetch(`http://localhost:5000/api/insurances/${id}/payment`, {
@@ -2849,6 +3169,18 @@ function FinanceProvider({ children }) {
 
     const data = await response.json();
     if (!response.ok || !data.success) {
+      if (data.code === "INSUFFICIENT_FUNDS") {
+        showInsufficientFundsModal({
+          availableAmount: data.availableAmount,
+          requestedAmount: data.requestedAmount,
+          message: data.message,
+        });
+        const err = new Error(data.message || "Insufficient funds available.");
+        err.code = "INSUFFICIENT_FUNDS";
+        err.availableAmount = data.availableAmount;
+        err.requestedAmount = data.requestedAmount;
+        throw err;
+      }
       throw new Error(data.message || "Failed to record payment.");
     }
 
@@ -3049,9 +3381,28 @@ function FinanceProvider({ children }) {
     const token = getAuthToken();
 
     const baseData = typeof paymentData === "object" ? paymentData : { amount: paymentData };
+    const targetMonthIso = baseData.selectedMonth || selectedMonth || activeWorkingPeriod.iso;
+    const reqAmount = Number(baseData.amount);
+
+    if (targetMonthIso === activeWorkingPeriod.iso && Number.isFinite(reqAmount) && reqAmount > availableToAllocate) {
+      showInsufficientFundsModal({
+        availableAmount: availableToAllocate,
+        requestedAmount: reqAmount,
+      });
+      const err = new Error(
+        `You don't have sufficient funds available to make this payment. Your available balance is ${formatINR(
+          availableToAllocate
+        )}, but the requested amount is ${formatINR(reqAmount)}.`
+      );
+      err.code = "INSUFFICIENT_FUNDS";
+      err.availableAmount = availableToAllocate;
+      err.requestedAmount = reqAmount;
+      throw err;
+    }
+
     const dataPayload = {
       ...baseData,
-      selectedMonth: baseData.selectedMonth || selectedMonth || activeWorkingPeriod.iso,
+      selectedMonth: targetMonthIso,
     };
 
     const response = await fetch(`http://localhost:5000/api/liabilities/${id}/payment`, {
@@ -3065,6 +3416,18 @@ function FinanceProvider({ children }) {
 
     const data = await response.json();
     if (!response.ok || !data.success) {
+      if (data.code === "INSUFFICIENT_FUNDS") {
+        showInsufficientFundsModal({
+          availableAmount: data.availableAmount,
+          requestedAmount: data.requestedAmount,
+          message: data.message,
+        });
+        const err = new Error(data.message || "Insufficient funds available.");
+        err.code = "INSUFFICIENT_FUNDS";
+        err.availableAmount = data.availableAmount;
+        err.requestedAmount = data.requestedAmount;
+        throw err;
+      }
       throw new Error(data.message || "Failed to record payment.");
     }
 
@@ -3173,6 +3536,57 @@ function FinanceProvider({ children }) {
       clearTimeout(phase2Timer);
       setAiLoading(false);
       setAiLoadingMessage("Refreshing financial and market data...");
+    }
+  };
+
+  // Fetch live verified market benchmarks
+  const fetchMarketData = async () => {
+    try {
+      const token = getAuthToken();
+      if (!token) return null;
+      setMarketDataLoading(true);
+      setMarketDataError(null);
+      const response = await fetch("http://localhost:5000/api/ai/market-data", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json();
+      if (data.success && data.data) {
+        setMarketData(data.data);
+        return data.data;
+      }
+      return null;
+    } catch (err) {
+      console.error("Fetch market data error:", err);
+      setMarketDataError(err.message);
+      return null;
+    } finally {
+      setMarketDataLoading(false);
+    }
+  };
+
+  // Force fresh provider refresh of market benchmarks
+  const refreshMarketData = async () => {
+    try {
+      const token = getAuthToken();
+      if (!token) return null;
+      setMarketDataLoading(true);
+      setMarketDataError(null);
+      const response = await fetch("http://localhost:5000/api/ai/market-data/refresh", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json();
+      if (data.success && data.data) {
+        setMarketData(data.data);
+        return data.data;
+      }
+      return null;
+    } catch (err) {
+      console.error("Refresh market data error:", err);
+      setMarketDataError(err.message);
+      return null;
+    } finally {
+      setMarketDataLoading(false);
     }
   };
 
@@ -3720,6 +4134,10 @@ function FinanceProvider({ children }) {
     totalMonthlyIncome,
     monthlySavings,
     availableToAllocate,
+    insufficientFundsModal,
+    showInsufficientFundsModal,
+    handleInsufficientFundsClose,
+    addInvestmentTransaction,
 
     // Additional Income
     additionalIncomeTransactions,
@@ -3869,11 +4287,29 @@ function FinanceProvider({ children }) {
     aiError,
     fetchLatestAISuggestion,
     generateAISuggestion,
+    marketData,
+    marketDataLoading,
+    marketDataError,
+    socketConnected,
+    marketDataLastReceived,
+    fetchMarketData,
+    refreshMarketData,
   };
 
   return (
     <FinanceContext.Provider value={value}>
       {children}
+      <CenteredModal
+        isOpen={insufficientFundsModal.isOpen}
+        onClose={handleInsufficientFundsClose}
+        title="Insufficient Funds"
+        message={insufficientFundsModal.message}
+        confirmText="OK"
+        confirmVariant="primary"
+        iconType="error"
+        type="alert"
+        onConfirm={handleInsufficientFundsClose}
+      />
       <CenteredModal
         isOpen={accountDeletedModalOpen}
         onClose={handleAccountDeletedRedirect}

@@ -4,6 +4,12 @@ const User = require("../models/User");
 const InvestmentMaturityAction = require("../models/InvestmentMaturityAction");
 const Liability = require("../models/Liability");
 const AdditionalIncome = require("../models/AdditionalIncome");
+const {
+  validateSufficientFunds,
+  withUserPaymentLock,
+  handleFundsError,
+  parsePeriod,
+} = require("../utils/fundValidationService");
 
 // Helper to log user activities safely under the strict Activity schema
 const logActivity = async (userId, description) => {
@@ -134,14 +140,59 @@ const addInvestment = async (req, res) => {
       });
     }
 
-    const investment = await Investment.create(investmentData);
+    const userId = req.user?.id || req.user?._id;
+
+    const numericAmount = Number(investmentData.amount);
+    if (!Number.isFinite(numericAmount) || numericAmount < 0) {
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_AMOUNT",
+        message: "Investment amount must be a valid positive number.",
+      });
+    }
+
+    const result = await withUserPaymentLock(userId, async () => {
+      // For One-Time purchases or FD deposits that consume available funds in the target month:
+      const isOneTimeOutflow =
+        investmentData.contributionType === "One-Time" ||
+        investmentData.contributionType === "One Time" ||
+        investmentData.type === "Fixed Deposit" ||
+        investmentData.type === "Stocks" ||
+        investmentData.type === "Gold" ||
+        (req.body.consumeAvailableFunds === true && numericAmount > 0);
+
+      if (isOneTimeOutflow && numericAmount > 0) {
+        const period = parsePeriod(req.body.selectedMonth || req.body.startDate);
+        await validateSufficientFunds({
+          userId,
+          year: period.year,
+          month: period.month,
+          requestedAmount: numericAmount,
+        });
+
+        if (!Array.isArray(investmentData.transactions)) {
+          investmentData.transactions = [];
+        }
+        investmentData.transactions.push({
+          type: "Buy",
+          amount: numericAmount,
+          date: req.body.startDate ? new Date(req.body.startDate) : new Date(),
+          paymentSource: investmentData.paymentSource || { method: "Cash" },
+          note: investmentData.type === "Fixed Deposit" ? "Initial Fixed Deposit" : "Initial Investment Purchase",
+        });
+      }
+
+      const investment = await Investment.create(investmentData);
+      return investment;
+    });
 
     res.status(201).json({
       success: true,
       message: "Investment added successfully.",
-      investment,
+      investment: result,
     });
   } catch (error) {
+    if (handleFundsError(res, error)) return;
     console.error("Add Investment:", error);
     res.status(500).json({
       success: false,
@@ -413,55 +464,87 @@ const addInvestmentTransaction = async (req, res) => {
     const { id } = req.params;
     const { type, amount, quantity, price, date, destination, note } = req.body;
 
-    const investment = await Investment.findOne({ _id: id, user: userId });
-    if (!investment) {
-      return res.status(404).json({ success: false, message: "Investment not found." });
-    }
+    const txAmount = Number(amount) || 0;
+    const isOutflow = type === "Buy" || type === "Additional Investment";
 
-    const transaction = {
-      type,
-      amount: Number(amount) || 0,
-      quantity: Number(quantity) || 0,
-      price: Number(price) || 0,
-      date: date ? new Date(date) : new Date(),
-      destination: destination || "",
-      note: note || "",
-    };
-
-    if (!Array.isArray(investment.transactions)) {
-      investment.transactions = [];
-    }
-
-    investment.transactions.push(transaction);
-
-    // Update totals based on transaction type
-    if (type === "Buy" || type === "Additional Investment") {
-      investment.amount = (Number(investment.amount) || 0) + transaction.amount;
-      investment.quantity = (Number(investment.quantity) || 0) + transaction.quantity;
-      if (investment.type === "Mutual Fund") {
-        investment.units = (Number(investment.units) || 0) + transaction.quantity;
-      } else if (investment.type === "Gold") {
-        investment.weight = (Number(investment.weight) || 0) + transaction.quantity;
-      }
-    } else if (type === "Sell" || type === "Redeem") {
-      investment.quantity = Math.max(0, (Number(investment.quantity) || 0) - transaction.quantity);
-      if (investment.type === "Mutual Fund") {
-        investment.units = Math.max(0, (Number(investment.units) || 0) - transaction.quantity);
-      } else if (investment.type === "Gold") {
-        investment.weight = Math.max(0, (Number(investment.weight) || 0) - transaction.quantity);
+    if (isOutflow) {
+      if (!Number.isFinite(txAmount) || txAmount <= 0) {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_AMOUNT",
+          message: "Transaction amount must be a valid positive number.",
+        });
       }
     }
 
-    await investment.save();
+    const result = await withUserPaymentLock(userId, async () => {
+      const investment = await Investment.findOne({ _id: id, user: userId });
+      if (!investment) {
+        const notFound = new Error("Investment not found.");
+        notFound.statusCode = 404;
+        throw notFound;
+      }
 
-    await logActivity(userId, `Added a ${type} transaction for ${investment.name}`);
+      if (isOutflow) {
+        const period = parsePeriod(req.body.selectedMonth || date);
+        await validateSufficientFunds({
+          userId,
+          year: period.year,
+          month: period.month,
+          requestedAmount: txAmount,
+        });
+      }
+
+      const transaction = {
+        type,
+        amount: txAmount,
+        quantity: Number(quantity) || 0,
+        price: Number(price) || 0,
+        date: date ? new Date(date) : new Date(),
+        destination: destination || "",
+        note: note || "",
+      };
+
+      if (!Array.isArray(investment.transactions)) {
+        investment.transactions = [];
+      }
+
+      investment.transactions.push(transaction);
+
+      // Update totals based on transaction type
+      if (isOutflow) {
+        investment.amount = (Number(investment.amount) || 0) + transaction.amount;
+        investment.quantity = (Number(investment.quantity) || 0) + transaction.quantity;
+        if (investment.type === "Mutual Fund") {
+          investment.units = (Number(investment.units) || 0) + transaction.quantity;
+        } else if (investment.type === "Gold") {
+          investment.weight = (Number(investment.weight) || 0) + transaction.quantity;
+        }
+      } else if (type === "Sell" || type === "Redeem") {
+        investment.quantity = Math.max(0, (Number(investment.quantity) || 0) - transaction.quantity);
+        if (investment.type === "Mutual Fund") {
+          investment.units = Math.max(0, (Number(investment.units) || 0) - transaction.quantity);
+        } else if (investment.type === "Gold") {
+          investment.weight = Math.max(0, (Number(investment.weight) || 0) - transaction.quantity);
+        }
+      }
+
+      await investment.save();
+      await logActivity(userId, `Added a ${type} transaction for ${investment.name}`);
+
+      return investment;
+    });
 
     res.status(201).json({
       success: true,
       message: "Transaction added successfully.",
-      investment,
+      investment: result,
     });
   } catch (error) {
+    if (handleFundsError(res, error)) return;
+    if (error.statusCode === 404) {
+      return res.status(404).json({ success: false, message: error.message });
+    }
     console.error("Add Investment Transaction Error:", error);
     res.status(500).json({ success: false, message: "Server Error", error: error.message });
   }
@@ -478,139 +561,170 @@ const { deriveDueDateForMonth, calculateDueDateForMonth, formatDateISO } = requi
 const addSIPContribution = async (req, res) => {
   try {
     const userId = req.user?.id || req.user?._id;
-    const investment = await Investment.findOne({
-      _id: req.params.id,
-      user: userId,
-    });
 
-    if (!investment) {
-      return res.status(404).json({
-        success: false,
-        message: "Investment not found.",
+    const result = await withUserPaymentLock(userId, async () => {
+      const investment = await Investment.findOne({
+        _id: req.params.id,
+        user: userId,
       });
-    }
 
-    const {
-      amount,
-      paidDate,
-      status,
-      note,
-      selectedMonth: reqSelectedMonth
-    } = req.body;
+      if (!investment) {
+        const notFoundErr = new Error("Investment not found.");
+        notFoundErr.statusCode = 404;
+        throw notFoundErr;
+      }
 
-    // Determine target working month context
-    const monthCtx = parseSelectedMonth(reqSelectedMonth || (paidDate ? String(paidDate).slice(0, 7) : null));
-    const targetYear = monthCtx.year;
-    const targetMonth = monthCtx.month;
-    const formattedMonth = `${getMonthName(targetMonth)} ${targetYear}`;
+      const {
+        amount,
+        paidDate,
+        status,
+        note,
+        selectedMonth: reqSelectedMonth
+      } = req.body;
 
-    // 1. Lifecycle check: Investment must have existed on or before target month
-    if (!isItemActiveInMonth(investment, targetYear, targetMonth)) {
-      const invStart = new Date(investment.startDate || investment.createdAt);
-      const startMonthName = getMonthName(invStart.getMonth() + 1);
-      return res.status(400).json({
-        success: false,
-        message: `Cannot record contribution in ${formattedMonth}. This investment started in ${startMonthName} ${invStart.getFullYear()}.`,
-      });
-    }
+      // Determine target working month context
+      const monthCtx = parseSelectedMonth(reqSelectedMonth || (paidDate ? String(paidDate).slice(0, 7) : null));
+      const targetYear = monthCtx.year;
+      const targetMonth = monthCtx.month;
+      const formattedMonth = `${getMonthName(targetMonth)} ${targetYear}`;
 
-    const contributionAmount = Number(amount ?? investment.monthlyContribution ?? investment.amount ?? 0);
-    if (!Number.isFinite(contributionAmount) || contributionAmount < 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Contribution amount must be a valid non-negative number.",
-      });
-    }
+      // 1. Lifecycle check: Investment must have existed on or before target month
+      if (!isItemActiveInMonth(investment, targetYear, targetMonth)) {
+        const invStart = new Date(investment.startDate || investment.createdAt);
+        const startMonthName = getMonthName(invStart.getMonth() + 1);
+        const err = new Error(`Cannot record contribution in ${formattedMonth}. This investment started in ${startMonthName} ${invStart.getFullYear()}.`);
+        err.statusCode = 400;
+        throw err;
+      }
 
-    const contributionStatus = status || "Not Paid";
-    const allowedStatuses = ["Paid", "Not Paid", "Skipped"];
-    if (!allowedStatuses.includes(contributionStatus)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid contribution status.",
-      });
-    }
+      let contributionAmount;
+      if (amount !== undefined) {
+        contributionAmount = Number(amount);
+      } else {
+        contributionAmount = Number(investment.monthlyContribution ?? investment.amount ?? 0);
+      }
 
-    // --------------------------------------------------------
-    // DERIVE DUE DATE FROM STORED SCHEDULE (server-side only)
-    // The client does NOT supply dueDate for recurring plans.
-    // --------------------------------------------------------
-    const storedDueDay = investment.dueDay
-      || (investment.reminder && investment.reminder.contributionDay)
-      || (investment.nextContributionDate ? new Date(investment.nextContributionDate).getDate() : null)
-      || (investment.startDate ? new Date(investment.startDate).getDate() : null)
-      || (paidDate ? new Date(paidDate).getDate() : 1);
+      if (!Number.isFinite(contributionAmount) || contributionAmount <= 0) {
+        const err = new Error("Contribution amount must be a valid positive number.");
+        err.code = "INVALID_AMOUNT";
+        err.statusCode = 400;
+        throw err;
+      }
 
-    const effectiveDueDate = calculateDueDateForMonth(storedDueDay, targetYear, targetMonth);
+      const contributionStatus = status || "Not Paid";
+      const allowedStatuses = ["Paid", "Not Paid", "Skipped"];
+      if (!allowedStatuses.includes(contributionStatus)) {
+        const err = new Error("Invalid contribution status.");
+        err.statusCode = 400;
+        throw err;
+      }
 
-    const effectivePaidDate = contributionStatus === "Paid"
-      ? (paidDate ? new Date(paidDate) : new Date())
-      : null;
-
-    // Validate paid date belongs to selected month
-    if (reqSelectedMonth && effectivePaidDate) {
-      if (!isDateInMonth(effectivePaidDate, targetYear, targetMonth)) {
-        return res.status(400).json({
-          success: false,
-          message: `Paid date must be within the selected month: ${formattedMonth}.`,
+      // Check sufficient funds if contribution is being marked as Paid
+      if (contributionStatus === "Paid") {
+        await validateSufficientFunds({
+          userId,
+          year: targetYear,
+          month: targetMonth,
+          requestedAmount: contributionAmount,
         });
       }
-    }
 
-    const rawPaymentSource = req.body.paymentSource || {};
-    const method = rawPaymentSource.method || "Cash";
-    const paymentSource = {
-      method,
-      bankName: (method === "Bank Account" || method === "UPI") ? (rawPaymentSource.bankName || "") : "",
-      last4Digits: method === "Bank Account" ? (rawPaymentSource.last4Digits || "") : "",
-      upiId: method === "UPI" ? (rawPaymentSource.upiId || "") : "",
-      otherDetails: method === "Other" ? (rawPaymentSource.otherDetails || "") : "",
-    };
+      // --------------------------------------------------------
+      // DERIVE DUE DATE FROM STORED SCHEDULE (server-side only)
+      // The client does NOT supply dueDate for recurring plans.
+      // --------------------------------------------------------
+      const storedDueDay = investment.dueDay
+        || (investment.reminder && investment.reminder.contributionDay)
+        || (investment.nextContributionDate ? new Date(investment.nextContributionDate).getDate() : null)
+        || (investment.startDate ? new Date(investment.startDate).getDate() : null)
+        || (paidDate ? new Date(paidDate).getDate() : 1);
 
-    const contribution = {
-      amount: contributionAmount,
-      dueDate: effectiveDueDate,
-      paidDate: effectivePaidDate,
-      status: contributionStatus,
-      paymentSource,
-      note: note || "",
-    };
+      const effectiveDueDate = calculateDueDateForMonth(storedDueDay, targetYear, targetMonth);
 
-    if (!Array.isArray(investment.sipContributions)) {
-      investment.sipContributions = [];
-    }
+      const effectivePaidDate = contributionStatus === "Paid"
+        ? (paidDate ? new Date(paidDate) : new Date())
+        : null;
 
-    investment.sipContributions.push(contribution);
-    
-    if (contributionStatus === "Paid") {
-      investment.amount = (Number(investment.amount) || 0) + contributionAmount;
-      investment.totalContributions = (Number(investment.totalContributions) || 0) + contributionAmount;
-
-      // Update type-specific quantities if provided in the contribution request
-      if (investment.type === "Gold" && (req.body.weight || req.body.quantity)) {
-        investment.weight = (Number(investment.weight) || 0) + Number(req.body.weight || req.body.quantity || 0);
-      } else if (investment.type === "Mutual Fund" && (req.body.units || req.body.quantity)) {
-        investment.units = (Number(investment.units) || 0) + Number(req.body.units || req.body.quantity || 0);
-      } else if (investment.type === "Stocks" && req.body.quantity) {
-        investment.quantity = (Number(investment.quantity) || 0) + Number(req.body.quantity || 0);
+      // Validate paid date belongs to selected month
+      if (reqSelectedMonth && effectivePaidDate) {
+        if (!isDateInMonth(effectivePaidDate, targetYear, targetMonth)) {
+          const err = new Error(`Paid date must be within the selected month: ${formattedMonth}.`);
+          err.statusCode = 400;
+          throw err;
+        }
       }
-    }
-    
-    await investment.save();
 
-    await logActivity(userId, `Recorded ${investment.type} contribution of ₹${contributionAmount} for ${investment.name}`);
+      const rawPaymentSource = req.body.paymentSource || {};
+      const method = rawPaymentSource.method || "Cash";
+      const paymentSource = {
+        method,
+        bankName: (method === "Bank Account" || method === "UPI") ? (rawPaymentSource.bankName || "") : "",
+        last4Digits: method === "Bank Account" ? (rawPaymentSource.last4Digits || "") : "",
+        upiId: method === "UPI" ? (rawPaymentSource.upiId || "") : "",
+        otherDetails: method === "Other" ? (rawPaymentSource.otherDetails || "") : "",
+      };
 
-    const createdContribution = investment.sipContributions[investment.sipContributions.length - 1];
+      const contribution = {
+        amount: contributionAmount,
+        dueDate: effectiveDueDate,
+        paidDate: effectivePaidDate,
+        status: contributionStatus,
+        paymentSource,
+        note: note || "",
+      };
+
+      if (!Array.isArray(investment.sipContributions)) {
+        investment.sipContributions = [];
+      }
+
+      investment.sipContributions.push(contribution);
+      
+      if (contributionStatus === "Paid") {
+        investment.amount = (Number(investment.amount) || 0) + contributionAmount;
+        investment.totalContributions = (Number(investment.totalContributions) || 0) + contributionAmount;
+
+        // Update type-specific quantities if provided in the contribution request
+        if (investment.type === "Gold" && (req.body.weight || req.body.quantity)) {
+          investment.weight = (Number(investment.weight) || 0) + Number(req.body.weight || req.body.quantity || 0);
+        } else if (investment.type === "Mutual Fund" && (req.body.units || req.body.quantity)) {
+          investment.units = (Number(investment.units) || 0) + Number(req.body.units || req.body.quantity || 0);
+        } else if (investment.type === "Stocks" && req.body.quantity) {
+          investment.quantity = (Number(investment.quantity) || 0) + Number(req.body.quantity || 0);
+        }
+      }
+      
+      await investment.save();
+
+      await logActivity(userId, `Recorded ${investment.type} contribution of ₹${contributionAmount} for ${investment.name}`);
+
+      const createdContribution = investment.sipContributions[investment.sipContributions.length - 1];
+
+      return {
+        contribution: createdContribution,
+        investment,
+        formattedMonth,
+        contributionAmount,
+        iso: monthCtx.iso,
+        effectiveDueDate,
+      };
+    });
 
     return res.status(201).json({
       success: true,
-      message: `${investment.type} contribution of ₹${contributionAmount.toLocaleString("en-IN")} recorded for ${formattedMonth}.`,
-      contribution: createdContribution,
-      investment,
-      selectedMonth: monthCtx.iso,
-      derivedDueDate: formatDateISO(effectiveDueDate),
+      message: `${result.investment.type} contribution of ₹${result.contributionAmount.toLocaleString("en-IN")} recorded for ${result.formattedMonth}.`,
+      contribution: result.contribution,
+      investment: result.investment,
+      selectedMonth: result.iso,
+      derivedDueDate: formatDateISO(result.effectiveDueDate),
     });
   } catch (error) {
+    if (handleFundsError(res, error)) return;
+    if (error.statusCode === 404) {
+      return res.status(404).json({ success: false, message: error.message });
+    }
+    if (error.statusCode === 400) {
+      return res.status(400).json({ success: false, message: error.message });
+    }
     console.error("Add SIP Contribution:", error);
     return res.status(500).json({
       success: false,
@@ -626,92 +740,111 @@ const addSIPContribution = async (req, res) => {
 const updateSIPContribution = async (req, res) => {
   try {
     const userId = req.user?.id || req.user?._id;
-    const investment = await Investment.findOne({
-      _id: req.params.id,
-      user: userId,
+
+    const result = await withUserPaymentLock(userId, async () => {
+      const investment = await Investment.findOne({
+        _id: req.params.id,
+        user: userId,
+      });
+
+      if (!investment) {
+        const notFoundErr = new Error("Investment not found.");
+        notFoundErr.statusCode = 404;
+        throw notFoundErr;
+      }
+
+      const contribution = investment.sipContributions.id(req.params.contributionId);
+      if (!contribution) {
+        const notFoundErr = new Error("SIP contribution not found.");
+        notFoundErr.statusCode = 404;
+        throw notFoundErr;
+      }
+
+      const { amount, dueDate, paidDate, status, note } = req.body;
+
+      // --------------------------------------------------------
+      // UPDATE AMOUNT
+      // --------------------------------------------------------
+
+      if (amount !== undefined) {
+        const newAmount = Number(amount);
+        if (!Number.isFinite(newAmount) || newAmount <= 0) {
+          const err = new Error("Contribution amount must be a valid positive number.");
+          err.code = "INVALID_AMOUNT";
+          err.statusCode = 400;
+          throw err;
+        }
+        contribution.amount = newAmount;
+      }
+
+      // --------------------------------------------------------
+      // UPDATE DUE DATE
+      // --------------------------------------------------------
+
+      if (dueDate !== undefined) {
+        contribution.dueDate = new Date(dueDate);
+      }
+
+      // --------------------------------------------------------
+      // UPDATE STATUS
+      // --------------------------------------------------------
+
+      if (status !== undefined) {
+        const allowedStatuses = ["Paid", "Not Paid", "Skipped"];
+        if (!allowedStatuses.includes(status)) {
+          const err = new Error("Invalid contribution status.");
+          err.statusCode = 400;
+          throw err;
+        }
+
+        if (status === "Paid" && contribution.status !== "Paid") {
+          const monthCtx = parseSelectedMonth(req.body.selectedMonth || (paidDate ? String(paidDate).slice(0, 7) : null));
+          await validateSufficientFunds({
+            userId,
+            year: monthCtx.year,
+            month: monthCtx.month,
+            requestedAmount: contribution.amount,
+          });
+        }
+
+        contribution.status = status;
+
+        if (status === "Paid") {
+          contribution.paidDate = paidDate ? new Date(paidDate) : contribution.paidDate || new Date();
+        } else {
+          contribution.paidDate = null;
+        }
+      } else if (paidDate !== undefined) {
+        contribution.paidDate = paidDate ? new Date(paidDate) : null;
+      }
+
+      // --------------------------------------------------------
+      // UPDATE NOTE
+      // --------------------------------------------------------
+
+      if (note !== undefined) {
+        contribution.note = note;
+      }
+
+      await investment.save();
+
+      return { contribution, investment };
     });
-
-    if (!investment) {
-      return res.status(404).json({
-        success: false,
-        message: "Investment not found.",
-      });
-    }
-
-    const contribution = investment.sipContributions.id(req.params.contributionId);
-    if (!contribution) {
-      return res.status(404).json({
-        success: false,
-        message: "SIP contribution not found.",
-      });
-    }
-
-    const { amount, dueDate, paidDate, status, note } = req.body;
-
-    // --------------------------------------------------------
-    // UPDATE AMOUNT
-    // --------------------------------------------------------
-
-    if (amount !== undefined) {
-      const newAmount = Number(amount);
-      if (!Number.isFinite(newAmount) || newAmount < 0) {
-        return res.status(400).json({
-          success: false,
-          message: "Contribution amount must be a valid number.",
-        });
-      }
-      contribution.amount = newAmount;
-    }
-
-    // --------------------------------------------------------
-    // UPDATE DUE DATE
-    // --------------------------------------------------------
-
-    if (dueDate !== undefined) {
-      contribution.dueDate = new Date(dueDate);
-    }
-
-    // --------------------------------------------------------
-    // UPDATE STATUS
-    // --------------------------------------------------------
-
-    if (status !== undefined) {
-      const allowedStatuses = ["Paid", "Not Paid", "Skipped"];
-      if (!allowedStatuses.includes(status)) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid contribution status.",
-        });
-      }
-
-      contribution.status = status;
-
-      if (status === "Paid") {
-        contribution.paidDate = paidDate ? new Date(paidDate) : contribution.paidDate || new Date();
-      } else {
-        contribution.paidDate = null;
-      }
-    } else if (paidDate !== undefined) {
-      contribution.paidDate = paidDate ? new Date(paidDate) : null;
-    }
-
-    // --------------------------------------------------------
-    // UPDATE NOTE
-    // --------------------------------------------------------
-
-    if (note !== undefined) {
-      contribution.note = note;
-    }
-
-    await investment.save();
 
     return res.status(200).json({
       success: true,
       message: "SIP contribution updated successfully.",
-      contribution,
-      investment,
+      contribution: result.contribution,
+      investment: result.investment,
     });
   } catch (error) {
+    if (handleFundsError(res, error)) return;
+    if (error.statusCode === 404) {
+      return res.status(404).json({ success: false, message: error.message });
+    }
+    if (error.statusCode === 400) {
+      return res.status(400).json({ success: false, message: error.message });
+    }
     console.error("Update SIP Contribution:", error);
     return res.status(500).json({
       success: false,

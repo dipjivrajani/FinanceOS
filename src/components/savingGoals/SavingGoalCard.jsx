@@ -857,6 +857,10 @@ function SavingGoalCard({
 
       }
       } catch (err) {
+        if (err?.code === "INSUFFICIENT_FUNDS") {
+          setShowContribution(false);
+          return;
+        }
         setError(err.message || "Failed to add contribution.");
       }
     };

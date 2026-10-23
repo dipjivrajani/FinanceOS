@@ -4,6 +4,12 @@
 
 const SavingGoal = require("../models/SavingGoal");
 const MonthlyFinance = require("../models/MonthlyFinance");
+const {
+  validateSufficientFunds,
+  withUserPaymentLock,
+  handleFundsError,
+  parsePeriod,
+} = require("../utils/fundValidationService");
 
 // Helper to get or create current monthly finance
 const getCurrentMonthlyFinance = async (userId) => {
@@ -55,75 +61,118 @@ const addSavingGoal = async (req, res) => {
     }
 
     const initialSaved = Number(
-      req.body.initialContribution ||
-      req.body.alreadySaved ||
-      req.body.savedAmount ||
-      0
+      req.body.initialContribution !== undefined
+        ? req.body.initialContribution
+        : (req.body.alreadySaved !== undefined
+            ? req.body.alreadySaved
+            : (req.body.savedAmount !== undefined ? req.body.savedAmount : 0))
     );
 
-    let finance = await getCurrentMonthlyFinance(userId);
-
-    // If initial contribution > 0, verify affordability
-    if (initialSaved > 0 && finance) {
-      if (initialSaved > finance.availableToAllocate) {
-        return res.status(400).json({
-          success: false,
-          message: `Initial contribution of ₹${initialSaved.toLocaleString("en-IN")} exceeds your available to allocate of ₹${finance.availableToAllocate.toLocaleString("en-IN")}.`,
-          availableToAllocate: finance.availableToAllocate,
-          requestedContribution: initialSaved,
-        });
-      }
-    }
-
-    const contributions = [];
-    if (initialSaved > 0) {
-      contributions.push({
-        amount: initialSaved,
-        date: req.body.initialContributionDate || startDate || new Date(),
-        source: initialContributionSource || "Existing Savings",
-        note: "Initial contribution at goal creation",
-        fundLocation: fundLocation,
-        createdAt: new Date(),
+    if (!Number.isFinite(initialSaved) || initialSaved < 0) {
+      return res.status(400).json({
+        success: false,
+        code: "INVALID_AMOUNT",
+        message: "Initial contribution amount must be zero or a valid positive number.",
       });
     }
 
-    const goalStatus =
-      initialSaved >= numericTarget
-        ? "Completed"
-        : (req.body.status || "Active");
+    let finance = await getCurrentMonthlyFinance(userId);
 
+    // If initial contribution > 0, verify affordability under user concurrency lock
+    if (initialSaved > 0) {
+      return await withUserPaymentLock(userId, async () => {
+        const period = parsePeriod(
+          req.body.selectedMonth,
+          req.body.initialContributionDate || startDate
+        );
+
+        await validateSufficientFunds({
+          userId,
+          year: period.year,
+          month: period.month,
+          requestedAmount: initialSaved,
+        });
+
+        const contributions = [
+          {
+            amount: initialSaved,
+            date: req.body.initialContributionDate || startDate || new Date(),
+            source: initialContributionSource || "Existing Savings",
+            note: "Initial contribution at goal creation",
+            fundLocation: fundLocation,
+            createdAt: new Date(),
+          },
+        ];
+
+        const goalStatus =
+          initialSaved >= numericTarget
+            ? "Completed"
+            : (req.body.status || "Active");
+
+        const goal = await SavingGoal.create({
+          user: userId,
+          goalName: goalName.trim(),
+          category,
+          targetAmount: numericTarget,
+          alreadySaved: initialSaved,
+          currentAmount: initialSaved,
+          monthlyContribution: Number(req.body.monthlyContribution || 0),
+          startDate: startDate || new Date(),
+          targetDate: targetDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+          status: goalStatus,
+          notes: notes.trim(),
+          fundLocation,
+          initialContributionDate: req.body.initialContributionDate || startDate,
+          initialContributionSource,
+          contributions,
+          withdrawals: [],
+          reminder,
+        });
+
+        if (finance) {
+          finance.goalAllocations = Number(finance.goalAllocations || 0) + initialSaved;
+          finance.closingBalance =
+            (finance.openingBalance || finance.cashBalance || 0) +
+            finance.monthlySavings -
+            finance.goalAllocations -
+            (finance.commitments || 0);
+          await finance.save();
+        }
+
+        return res.status(201).json({
+          success: true,
+          message: "Saving goal created successfully.",
+          goal,
+          financialSummary: {
+            availableToAllocate: finance ? finance.availableToAllocate : null,
+          },
+        });
+      });
+    }
+
+    // Initial contribution is 0: create goal without locking or consuming funds
+    const goalStatus = req.body.status || "Active";
     const goal = await SavingGoal.create({
       user: userId,
       goalName: goalName.trim(),
       category,
       targetAmount: numericTarget,
-      alreadySaved: initialSaved,
-      currentAmount: initialSaved,
+      alreadySaved: 0,
+      currentAmount: 0,
       monthlyContribution: Number(req.body.monthlyContribution || 0),
       startDate: startDate || new Date(),
       targetDate: targetDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
       status: goalStatus,
       notes: notes.trim(),
       fundLocation,
-      initialContributionDate: req.body.initialContributionDate || startDate,
+      initialContributionDate: null,
       initialContributionSource,
-      contributions,
+      contributions: [],
       withdrawals: [],
       reminder,
     });
 
-    // ONLY update monthly finance goalAllocations if an actual initial contribution > 0 was made
-    if (initialSaved > 0 && finance) {
-      finance.goalAllocations = Number(finance.goalAllocations || 0) + initialSaved;
-      finance.closingBalance =
-        (finance.openingBalance || finance.cashBalance || 0) +
-        finance.monthlySavings -
-        finance.goalAllocations -
-        (finance.commitments || 0);
-      await finance.save();
-    }
-
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
       message: "Saving goal created successfully.",
       goal,
@@ -132,6 +181,7 @@ const addSavingGoal = async (req, res) => {
       },
     });
   } catch (error) {
+    if (handleFundsError(res, error)) return;
     console.error("Add Saving Goal Error:", error);
     res.status(500).json({
       success: false,
@@ -336,87 +386,86 @@ const addGoalContribution = async (req, res) => {
       });
     }
 
-    // 3. Find or initialize MonthlyFinance for the targeted working month
-    let finance = await MonthlyFinance.findOne({
-      user: userId,
-      month: targetMonth,
-      year: targetYear,
-    });
+    return await withUserPaymentLock(userId, async () => {
+      // Validate sufficient funds against authoritative cash flow calculation
+      await validateSufficientFunds({
+        userId,
+        year: targetYear,
+        month: targetMonth,
+        requestedAmount: contributionAmount,
+      });
 
-    if (!finance) {
-      finance = await MonthlyFinance.create({
+      // 3. Find or initialize MonthlyFinance for the targeted working month
+      let finance = await MonthlyFinance.findOne({
         user: userId,
         month: targetMonth,
         year: targetYear,
-        income: 0,
-        expenses: 0,
-        openingBalance: 0,
-        cashBalance: 0,
-        closingBalance: 0,
-        goalAllocations: 0,
-        commitments: 0,
       });
-    }
 
-    // Check affordability against Available to Allocate if sourced from monthly liquidity
-    if (source === "Monthly Savings" && finance.availableToAllocate > 0) {
-      if (contributionAmount > finance.availableToAllocate) {
-        return res.status(400).json({
-          success: false,
-          message: `Contribution of ₹${contributionAmount.toLocaleString("en-IN")} exceeds your available to allocate of ₹${finance.availableToAllocate.toLocaleString("en-IN")} for ${formattedMonth}.`,
-          availableToAllocate: finance.availableToAllocate,
-          requestedContribution: contributionAmount,
+      if (!finance) {
+        finance = await MonthlyFinance.create({
+          user: userId,
+          month: targetMonth,
+          year: targetYear,
+          income: 0,
+          expenses: 0,
+          openingBalance: 0,
+          cashBalance: 0,
+          closingBalance: 0,
+          goalAllocations: 0,
+          commitments: 0,
         });
       }
-    }
 
-    // Record contribution with the validated date
-    const newContribution = {
-      amount: contributionAmount,
-      date: effectiveDate,
-      source: source || "Monthly Savings",
-      note: note.trim(),
-      paymentDetails: paymentDetails || {},
-      fundLocation: fundLocation || goal.fundLocation || {},
-      createdAt: new Date(),
-    };
+      // Record contribution with the validated date
+      const newContribution = {
+        amount: contributionAmount,
+        date: effectiveDate,
+        source: source || "Monthly Savings",
+        note: note.trim(),
+        paymentDetails: paymentDetails || {},
+        fundLocation: fundLocation || goal.fundLocation || {},
+        createdAt: new Date(),
+      };
 
-    if (!Array.isArray(goal.contributions)) {
-      goal.contributions = [];
-    }
+      if (!Array.isArray(goal.contributions)) {
+        goal.contributions = [];
+      }
 
-    goal.contributions.push(newContribution);
-    goal.currentAmount = (goal.currentAmount || 0) + contributionAmount;
+      goal.contributions.push(newContribution);
+      goal.currentAmount = (goal.currentAmount || 0) + contributionAmount;
 
-    // Check goal completion
-    if (goal.currentAmount >= goal.targetAmount) {
-      goal.status = "Completed";
-    }
+      // Check goal completion
+      if (goal.currentAmount >= goal.targetAmount) {
+        goal.status = "Completed";
+      }
 
-    await goal.save();
+      await goal.save();
 
-    // Deduct contribution from target month's MonthlyFinance
-    if (finance) {
-      finance.goalAllocations = Number(finance.goalAllocations || 0) + contributionAmount;
-      finance.closingBalance =
-        (finance.openingBalance || finance.cashBalance || 0) +
-        finance.monthlySavings -
-        finance.goalAllocations -
-        (finance.commitments || 0);
-      await finance.save();
-    }
+      // Deduct contribution from target month's MonthlyFinance
+      if (finance) {
+        finance.goalAllocations = Number(finance.goalAllocations || 0) + contributionAmount;
+        finance.closingBalance =
+          (finance.openingBalance || finance.cashBalance || 0) +
+          finance.monthlySavings -
+          finance.goalAllocations -
+          (finance.commitments || 0);
+        await finance.save();
+      }
 
-    res.status(200).json({
-      success: true,
-      message: `Contribution of ₹${contributionAmount.toLocaleString("en-IN")} recorded for ${formattedMonth}.`,
-      goal,
-      selectedMonth: monthCtx.iso,
-      contribution: newContribution,
-      financialSummary: {
-        availableToAllocate: finance ? finance.availableToAllocate : null,
-      },
+      return res.status(200).json({
+        success: true,
+        message: `Contribution of ₹${contributionAmount.toLocaleString("en-IN")} recorded for ${formattedMonth}.`,
+        goal,
+        selectedMonth: monthCtx.iso,
+        contribution: newContribution,
+        financialSummary: {
+          availableToAllocate: finance ? finance.availableToAllocate : null,
+        },
+      });
     });
   } catch (error) {
+    if (handleFundsError(res, error)) return;
     console.error("Add Goal Contribution Error:", error);
     res.status(500).json({
       success: false,
@@ -459,54 +508,58 @@ const updateGoalContribution = async (req, res) => {
     const newAmount = amount !== undefined ? Number(amount) : oldAmount;
     const diff = newAmount - oldAmount;
 
-    let finance = await getCurrentMonthlyFinance(userId);
-
-    // If increasing contribution, verify affordability
-    if (diff > 0 && finance) {
-      if (diff > finance.availableToAllocate) {
-        return res.status(400).json({
-          success: false,
-          message: `Increasing contribution by ₹${diff.toLocaleString("en-IN")} exceeds available to allocate of ₹${finance.availableToAllocate.toLocaleString("en-IN")}.`,
+    return await withUserPaymentLock(userId, async () => {
+      // If increasing contribution, verify affordability
+      if (diff > 0) {
+        const period = parsePeriod(req.body.selectedMonth, date || contribution.date);
+        await validateSufficientFunds({
+          userId,
+          year: period.year,
+          month: period.month,
+          requestedAmount: diff,
         });
       }
-    }
 
-    if (amount !== undefined) contribution.amount = newAmount;
-    if (date !== undefined) contribution.date = date;
-    if (source !== undefined) contribution.source = source;
-    if (note !== undefined) contribution.note = note.trim();
-    if (paymentDetails !== undefined) contribution.paymentDetails = paymentDetails;
-    if (fundLocation !== undefined) contribution.fundLocation = fundLocation;
+      let finance = await getCurrentMonthlyFinance(userId);
 
-    goal.currentAmount = Math.max(0, (goal.currentAmount || 0) + diff);
+      if (amount !== undefined) contribution.amount = newAmount;
+      if (date !== undefined) contribution.date = date;
+      if (source !== undefined) contribution.source = source;
+      if (note !== undefined) contribution.note = note.trim();
+      if (paymentDetails !== undefined) contribution.paymentDetails = paymentDetails;
+      if (fundLocation !== undefined) contribution.fundLocation = fundLocation;
 
-    if (goal.currentAmount >= goal.targetAmount) {
-      goal.status = "Completed";
-    } else if (goal.status === "Completed") {
-      goal.status = "Active";
-    }
+      goal.currentAmount = Math.max(0, (goal.currentAmount || 0) + diff);
 
-    await goal.save();
+      if (goal.currentAmount >= goal.targetAmount) {
+        goal.status = "Completed";
+      } else if (goal.status === "Completed") {
+        goal.status = "Active";
+      }
 
-    if (diff !== 0 && finance) {
-      finance.goalAllocations = Math.max(0, Number(finance.goalAllocations || 0) + diff);
-      finance.closingBalance =
-        (finance.openingBalance || finance.cashBalance || 0) +
-        finance.monthlySavings -
-        finance.goalAllocations -
-        (finance.commitments || 0);
-      await finance.save();
-    }
+      await goal.save();
 
-    res.status(200).json({
-      success: true,
-      message: "Contribution updated successfully.",
-      goal,
-      financialSummary: {
-        availableToAllocate: finance ? finance.availableToAllocate : null,
-      },
+      if (diff !== 0 && finance) {
+        finance.goalAllocations = Math.max(0, Number(finance.goalAllocations || 0) + diff);
+        finance.closingBalance =
+          (finance.openingBalance || finance.cashBalance || 0) +
+          finance.monthlySavings -
+          finance.goalAllocations -
+          (finance.commitments || 0);
+        await finance.save();
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Contribution updated successfully.",
+        goal,
+        financialSummary: {
+          availableToAllocate: finance ? finance.availableToAllocate : null,
+        },
+      });
     });
   } catch (error) {
+    if (handleFundsError(res, error)) return;
     console.error("Update Goal Contribution Error:", error);
     res.status(500).json({
       success: false,

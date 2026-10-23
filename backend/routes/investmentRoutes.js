@@ -69,6 +69,13 @@ router.put(
   updateSIPContribution
 );
 
+// Add Investment Transaction (Buy, Additional Investment, etc.)
+router.post(
+  "/:id/transactions",
+  authMiddleware,
+  addInvestmentTransaction
+);
+
 // ============================================================
 // CORE INVESTMENT
 // ============================================================

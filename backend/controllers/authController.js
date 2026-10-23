@@ -22,24 +22,19 @@ const ADMIN_EMAILS = [
 
 
 // ============================================================
-// CHECK EMAIL CONFIGURATION
+// CENTRALIZED EMAIL SERVICE
 // ============================================================
+
+const { sendOTPEmail, verifyTransporter, maskEmail } = require("../services/emailService");
 
 console.log("=================================");
 console.log("FINANCEOS EMAIL CONFIGURATION");
-console.log("EMAIL_USER:", process.env.EMAIL_USER);
+console.log("EMAIL_USER:", maskEmail(process.env.EMAIL_USER));
 console.log(
   "EMAIL_PASSWORD:",
   process.env.EMAIL_PASSWORD ? "LOADED" : "NOT FOUND"
 );
 console.log("=================================");
-
-
-// ============================================================
-// CENTRALIZED EMAIL SERVICE
-// ============================================================
-
-const { sendOTPEmail, verifyTransporter } = require("../services/emailService");
 
 // IN-FLIGHT REQUEST SET (PREVENTS DUPLICATE CONCURRENT SENDS)
 const inflightOtpRequests = new Set();
@@ -95,8 +90,8 @@ const sendLoginOTP = async (req, res) => {
 
 
     console.log(
-      "Email:",
-      email
+      "Recipient:",
+      maskEmail(email)
     );
 
 
@@ -124,6 +119,8 @@ const sendLoginOTP = async (req, res) => {
         .trim()
         .toLowerCase();
 
+    // Stage 1: Request received
+    console.log("[AUTH] Send OTP request received for:", maskEmail(normalizedEmail));
 
     // ========================================================
     // CONCURRENT IN-FLIGHT REQUEST CHECK
@@ -200,21 +197,7 @@ const sendLoginOTP = async (req, res) => {
     const role =
       getUserRole(normalizedEmail, user);
 
-
-    console.log(
-      "User found:",
-      user.email
-    );
-
-    console.log(
-      "Assigned role:",
-      role
-    );
-
-    console.log(
-      "Status:",
-      user.status
-    );
+    console.log("[AUTH] Account verified for:", maskEmail(user.email), "| Status:", user.status);
 
 
     // ========================================================
@@ -278,32 +261,6 @@ const sendLoginOTP = async (req, res) => {
 
 
     // ========================================================
-    // DEVELOPMENT ONLY — DISPLAY OTP IN TERMINAL
-    //
-    // This block prints the OTP to the backend terminal so the
-    // developer can complete login without phone access during
-    // local development and demos.
-    //
-    // SECURITY: Automatically disabled in production even if
-    // SHOW_OTP_IN_TERMINAL is set to true.
-    //
-    // The email is STILL sent normally via Nodemailer.
-    // ========================================================
-
-    if (
-      process.env.NODE_ENV !== "production" &&
-      process.env.SHOW_OTP_IN_TERMINAL === "true"
-    ) {
-      console.log("==================================================");
-      console.log("[FINANCEOS OTP - DEVELOPMENT ONLY]");
-      console.log(`Email: ${normalizedEmail}`);
-      console.log(`OTP: ${otp}`);
-      console.log("Expires: 5 minutes");
-      console.log("==================================================");
-    }
-
-
-    // ========================================================
     // OTP EXPIRATION
     //
     // OTP valid for 5 minutes
@@ -334,14 +291,13 @@ const sendLoginOTP = async (req, res) => {
 
     // ========================================================
     // ATTEMPT EMAIL DISPATCH VIA CENTRALIZED SERVICE
-    //
-    // In development mode, an email failure does NOT destroy
-    // the legitimate generated OTP from MongoDB.
-    // The developer can use the OTP printed to the terminal.
     // ========================================================
 
     let emailSent = false;
     let emailErrorMsg = null;
+
+    // Stage 2: Calling email service
+    console.log("[AUTH] Calling email service for:", maskEmail(normalizedEmail));
 
     try {
       const emailResult = await sendOTPEmail(normalizedEmail, otp);
@@ -354,8 +310,16 @@ const sendLoginOTP = async (req, res) => {
       emailErrorMsg = mailErr.message || "Email service exception";
     }
 
+    // Stage 3: Email service dispatch result
+    console.log(
+      "[AUTH] Email service dispatch outcome:",
+      emailSent ? "ACCEPTED" : "FAILED",
+      "| error:",
+      emailErrorMsg || "none"
+    );
+
     if (emailSent) {
-      console.log(`[AUTH] OTP email successfully delivered to ${normalizedEmail}`);
+      console.log(`[AUTH] OTP email successfully accepted by SMTP for: ${maskEmail(normalizedEmail)}`);
       console.log("Assigned role:", role);
       console.log("=================================");
 
@@ -366,29 +330,12 @@ const sendLoginOTP = async (req, res) => {
       });
     }
 
-    // Email delivery failed
+    // Email delivery failed — roll back OTP from DB so un-sent OTP cannot be used
     console.error(
-      `[AUTH] Send OTP email failed for ${normalizedEmail}:`,
+      `[AUTH] Send OTP email failed for ${maskEmail(normalizedEmail)}:`,
       emailErrorMsg
     );
 
-    if (process.env.NODE_ENV !== "production") {
-      // DEVELOPMENT / EXAM DEMO MODE:
-      // The OTP was generated and saved to MongoDB. The terminal displays it.
-      // Do NOT roll back the OTP in development!
-      console.log(
-        `[AUTH] Development mode active: OTP preserved in database. Use terminal OTP to log in.`
-      );
-
-      return res.status(200).json({
-        success: true,
-        emailSent: false,
-        message:
-          "OTP generated. Email delivery failed. Development terminal OTP is available.",
-      });
-    }
-
-    // PRODUCTION MODE: Roll back OTP if email delivery failed
     try {
       await User.findByIdAndUpdate(user._id, {
         $set: { otp: null, otpExpiresAt: null },
@@ -397,7 +344,10 @@ const sendLoginOTP = async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: "Unable to send OTP email. Please try again.",
+      emailSent: false,
+      code: "EMAIL_DELIVERY_FAILED",
+      message:
+        "We couldn't send the verification code. Please check your email service configuration and try again.",
     });
 
   } catch (error) {
@@ -637,8 +587,8 @@ const verifyLoginOTP = async (req, res) => {
     );
 
     console.log(
-      "Email:",
-      normalizedEmail
+      "Recipient:",
+      maskEmail(normalizedEmail)
     );
 
     console.log(

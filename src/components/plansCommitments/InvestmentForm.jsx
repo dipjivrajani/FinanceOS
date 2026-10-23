@@ -772,6 +772,11 @@ function InvestmentForm({ onClose, onSuccess, editingInvestment = null }) {
 
     const result = await addInvestment(investmentData);
     if (result?.success === false) {
+      if (result?.code === "INSUFFICIENT_FUNDS") {
+        setIsSubmitting(false);
+        if (typeof onClose === "function") onClose();
+        return;
+      }
       setError(result.message || "Unable to add the investment.");
       setIsSubmitting(false);
       return;

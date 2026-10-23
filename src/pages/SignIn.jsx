@@ -500,15 +500,6 @@ function SignIn() {
       const data =
         await response.json();
 
-      console.log(
-        "Send OTP Response:",
-        data
-      );
-
-      // ======================================================
-      // BACKEND ERROR
-      // ======================================================
-
       if (!response.ok) {
         if (response.status === 404 || data.code === "ACCOUNT_NOT_FOUND") {
           setAccountNotFound(true);
@@ -530,6 +521,16 @@ function SignIn() {
             data.message ||
               "Please enter a valid email address."
           );
+        } else if (data.code === "EMAIL_DELIVERY_FAILED" || response.status === 500) {
+          const errorMsg =
+            "We couldn't send the verification code. Please check your email service configuration and try again.";
+          setLoginError(errorMsg);
+          setAuthModal({
+            isOpen: true,
+            title: "Email Delivery Failed",
+            message: errorMsg,
+            iconType: "error",
+          });
         } else {
           setLoginError(
             data.message ||
@@ -537,6 +538,23 @@ function SignIn() {
           );
         }
 
+        return;
+      }
+
+      // ======================================================
+      // CHECK EMAIL DISPATCH SUCCESS
+      // ======================================================
+
+      if (data.emailSent === false) {
+        const errorMsg =
+          "We couldn't send the verification code. Please check your email service configuration and try again.";
+        setLoginError(errorMsg);
+        setAuthModal({
+          isOpen: true,
+          title: "Email Delivery Failed",
+          message: errorMsg,
+          iconType: "error",
+        });
         return;
       }
 
@@ -550,19 +568,9 @@ function SignIn() {
       }));
 
       setOtpMode(true);
-
       setOtpDigits(["", "", "", "", "", ""]);
-
+      setOtpNotice("");
       startOtpTimer();
-
-      if (data.emailSent === false) {
-        setOtpNotice(
-          data.message ||
-            "OTP generated. Email delivery failed. Development terminal OTP is available."
-        );
-      } else {
-        setOtpNotice("");
-      }
 
     } catch (error) {
       console.error(
@@ -1300,16 +1308,6 @@ function SignIn() {
                       )}
                     </div>
                   </div>
-
-                  {/* OTP NOTICE (DEVELOPMENT / TERMINAL NOTICE) */}
-                  {otpNotice && (
-                    <div className="mt-3 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
-                      <span className="text-amber-600 text-sm">ℹ️</span>
-                      <p className="text-xs font-medium leading-5 text-amber-800">
-                        {otpNotice}
-                      </p>
-                    </div>
-                  )}
 
                   {/* ERROR */}
                   {loginError && (

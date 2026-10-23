@@ -42,6 +42,12 @@ import {
   FiZap,
   FiX,
   FiRefreshCw,
+  FiShield,
+  FiClock,
+  FiExternalLink,
+  FiCheck,
+  FiPercent,
+  FiActivity,
 } from "react-icons/fi";
 
 
@@ -52,6 +58,7 @@ import CenteredModal from "../common/CenteredModal.jsx";
 
 import MaturityActionModal
   from "./MaturityActionModal.jsx";
+import AISuggestionDetailsModalComponent from "./AISuggestionDetailsModal.jsx";
 
 
 // ============================================================
@@ -75,14 +82,9 @@ function safeNumber(value) {
 // ============================================================
 
 function formatMoney(value) {
-
-  return safeNumber(value)
-    .toLocaleString(
-      "en-US",
-      {
-        maximumFractionDigits: 0,
-      }
-    );
+  return safeNumber(value).toLocaleString("en-IN", {
+    maximumFractionDigits: 0,
+  });
 }
 
 
@@ -1119,28 +1121,48 @@ function FinancialSuggestions() {
       minute: "2-digit",
     });
 
+    const situationSnippet = latestAISuggestion.yourSituation?.text || latestAISuggestion.summary || "";
+
     suggestions.push({
       id: `ai-suggestion-${latestAISuggestion._id || latestAISuggestion.id || "latest"}`,
       isAI: true,
       type: "success",
       icon: FiZap,
-      title: latestAISuggestion.title || "AI Financial Recommendation",
-      description: `${latestAISuggestion.summary || ""} • Last analyzed: ${analysisDateStr}`,
+      title: latestAISuggestion.title || "Personal AI Financial Guide",
+      description: `${situationSnippet} • Updated: ${analysisDateStr}`,
       category: "ai",
       priority: 200,
       actions: [
         {
           id: "view-ai-suggestion",
-          label: "View Suggestion",
+          label: "See Details & Options",
           primary: true,
         },
         {
           id: "refresh-ai-suggestion",
-          label: finance?.aiLoading ? "Analyzing..." : "Refresh Analysis",
+          label: finance?.aiLoading ? "Analyzing..." : "Re-analyze",
           primary: false,
         },
       ],
       rawAI: latestAISuggestion,
+    });
+  } else {
+    suggestions.push({
+      id: "ai-suggestion-invite",
+      isAI: true,
+      type: "money",
+      icon: FiZap,
+      title: "Personal AI Financial Guide",
+      description: "Get personalized, everyday English guidance on what to do with your available funds, emergency cushion, and investments.",
+      category: "ai",
+      priority: 200,
+      actions: [
+        {
+          id: "refresh-ai-suggestion",
+          label: finance?.aiLoading ? "Analyzing..." : "Generate Analysis",
+          primary: true,
+        },
+      ],
     });
   }
 
@@ -1980,6 +2002,50 @@ function FinancialSuggestions() {
   //
   // ==========================================================
 
+  // AI ADVISER CARD (GEMINI + MONGODB + LIVE MARKET)
+  if (latestAISuggestion) {
+    suggestions.unshift({
+      id: "ai-personalized-adviser",
+      isAI: true,
+      category: "ai",
+      type: latestAISuggestion.overallHealth === "Needs Attention" ? "danger" : "money",
+      icon: FiZap,
+      title: latestAISuggestion.title,
+      description: latestAISuggestion.summary,
+      priority: 200,
+      actions: [
+        {
+          id: "view-ai-suggestion",
+          label: "View Full AI Analysis",
+          primary: true,
+        },
+        {
+          id: "refresh-ai-suggestion",
+          label: finance?.aiLoading ? "Analyzing..." : "Re-analyze",
+          primary: false,
+        },
+      ],
+    });
+  } else {
+    suggestions.unshift({
+      id: "ai-personalized-adviser-prompt",
+      isAI: true,
+      category: "ai",
+      type: "money",
+      icon: FiZap,
+      title: "Personalized AI Financial Adviser",
+      description: "Analyze your verified MongoDB income, debt, and savings against live Indian market data using Google Gemini.",
+      priority: 190,
+      actions: [
+        {
+          id: "refresh-ai-suggestion",
+          label: finance?.aiLoading ? "Analyzing..." : "Get AI Suggestion",
+          primary: true,
+        },
+      ],
+    });
+  }
+
   const aiSuggestions =
     suggestions.filter(
       (s) => s.isAI
@@ -2228,6 +2294,25 @@ function FinancialSuggestions() {
             space-y-3
           "
         >
+          {finance?.aiError && (
+            <div className="flex items-start justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50/80 p-3 text-xs text-rose-900 shadow-xs">
+              <div className="flex items-start gap-2">
+                <FiAlertTriangle className="mt-0.5 text-rose-600 shrink-0" size={15} />
+                <div>
+                  <p className="font-semibold text-rose-900">AI Financial Adviser Notice</p>
+                  <p className="mt-0.5 text-rose-700">{finance.aiError}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleRefreshAISuggestion}
+                disabled={finance?.aiLoading}
+                className="shrink-0 rounded-lg border border-rose-300 bg-white px-2.5 py-1 text-xs font-semibold text-rose-800 transition hover:bg-rose-100 disabled:opacity-50 cursor-pointer"
+              >
+                Retry
+              </button>
+            </div>
+          )}
 
 
           {
@@ -2671,7 +2756,11 @@ function SuggestionCard({
 // AI SUGGESTION DETAILS MODAL
 // ============================================================
 
-export function AISuggestionDetailsModal({ isOpen, suggestion, onClose, onRefresh, aiLoading }) {
+export function AISuggestionDetailsModal(props) {
+  return <AISuggestionDetailsModalComponent {...props} />;
+}
+
+function LegacyAISuggestionDetailsModal({ isOpen, suggestion, onClose, onRefresh, aiLoading }) {
   if (!isOpen || !suggestion) return null;
 
   const snapshot = suggestion.financialSnapshot || {};

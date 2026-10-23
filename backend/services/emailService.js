@@ -2,6 +2,9 @@
 // FINANCEOS - CENTRALIZED EMAIL SERVICE (PRODUCTION SMTP)
 // ============================================================
 
+const path = require("path");
+const dotenv = require("dotenv");
+dotenv.config({ path: path.resolve(__dirname, "../.env") });
 const nodemailer = require("nodemailer");
 
 /**
@@ -68,50 +71,141 @@ function isDeliverableEmail(email) {
   return true;
 }
 
-const hasEmailConfig = Boolean(
-  process.env.EMAIL_USER && process.env.EMAIL_PASSWORD
-);
+let cachedTransporter = null;
+let lastEmailUser = null;
+let lastEmailPass = null;
 
-// Normalize app password: strip spaces for reliability
-const normalizedEmailPassword = (process.env.EMAIL_PASSWORD || "")
-  .toString()
-  .replace(/\s+/g, "");
+function getTransporter() {
+  const currentPassword = (process.env.EMAIL_PASSWORD || "")
+    .toString()
+    .replace(/\s+/g, "");
+  const currentUser = (process.env.EMAIL_USER || "").toString().trim();
 
-// Explicit Gmail SMTP direct SSL configuration (Port 465, pooled, with timeouts)
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 465,
-  secure: true,
-  pool: true,
-  maxConnections: 5,
-  maxMessages: 100,
-  rateDelta: 1000,
-  rateLimit: 5,
-  auth: {
-    user: process.env.EMAIL_USER || "",
-    pass: normalizedEmailPassword,
-  },
-  connectionTimeout: 10000,
-  greetingTimeout: 5000,
-  socketTimeout: 10000,
-});
+  if (
+    cachedTransporter &&
+    lastEmailUser === currentUser &&
+    lastEmailPass === currentPassword
+  ) {
+    return cachedTransporter;
+  }
+
+  if (cachedTransporter && typeof cachedTransporter.close === "function") {
+    try {
+      cachedTransporter.close();
+    } catch (_) {}
+  }
+
+  lastEmailUser = currentUser;
+  lastEmailPass = currentPassword;
+
+  cachedTransporter = nodemailer.createTransport({
+    host: "smtp.gmail.com",
+    port: 465,
+    secure: true,
+    pool: true,
+    maxConnections: 5,
+    maxMessages: 100,
+    rateDelta: 1000,
+    rateLimit: 5,
+    auth: {
+      user: currentUser,
+      pass: currentPassword,
+    },
+    connectionTimeout: 10000,
+    greetingTimeout: 5000,
+    socketTimeout: 10000,
+  });
+
+  return cachedTransporter;
+}
+
+// Default transporter export for backwards compatibility
+const transporter = getTransporter();
+
+/**
+ * Safely sanitizes SMTP errors into clean, informative messages without exposing internal credentials or tokens.
+ */
+function sanitizeSmtpError(error) {
+  if (!error) return "Unknown SMTP error";
+  const msg = String(error.message || "");
+  const code = error.code || (error.responseCode ? `E${error.responseCode}` : null);
+
+  if (
+    code === "EAUTH" ||
+    msg.includes("535") ||
+    msg.includes("BadCredentials") ||
+    msg.includes("Username and Password not accepted")
+  ) {
+    return "Authentication failed: 535-5.7.8 BadCredentials (Invalid Gmail address or App Password)";
+  }
+  if (code === "ETIMEDOUT" || code === "ESOCKETTIMEDOUT") {
+    return "SMTP connection timed out (Port 465 SSL)";
+  }
+  if (code === "ECONNREFUSED") {
+    return "SMTP connection refused by host";
+  }
+  if (code === "ENOTFOUND") {
+    return "SMTP server host not found (DNS failure)";
+  }
+  return error.code || "SMTP delivery failure";
+}
+
+/**
+ * Safe programmatic diagnostic for SMTP connectivity.
+ * Returns only boolean connection state and sanitized status message.
+ */
+async function checkSmtpConnection() {
+  const currentPassword = (process.env.EMAIL_PASSWORD || "")
+    .toString()
+    .replace(/\s+/g, "");
+
+  if (!process.env.EMAIL_USER || !currentPassword) {
+    return {
+      configured: false,
+      connected: false,
+      status: "UNCONFIGURED",
+      message: "EMAIL_USER or EMAIL_PASSWORD missing in backend environment configuration",
+    };
+  }
+
+  try {
+    const activeTransporter = getTransporter();
+    await activeTransporter.verify();
+    return {
+      configured: true,
+      connected: true,
+      status: "CONNECTED",
+      message: "Gmail SMTP connected and verified successfully",
+    };
+  } catch (error) {
+    const sanitized = sanitizeSmtpError(error);
+    return {
+      configured: true,
+      connected: false,
+      status: "FAILED",
+      code: error.code || "EAUTH",
+      message: sanitized,
+    };
+  }
+}
 
 /**
  * Verify transporter at startup without logging sensitive secrets.
  */
 async function verifyTransporter() {
-  if (!hasEmailConfig) {
+  const diagnostic = await checkSmtpConnection();
+
+  if (!diagnostic.configured) {
     console.log("Email service configured: NO");
     return false;
   }
 
   console.log("Email service configured: YES");
-  try {
-    await transporter.verify();
+  if (diagnostic.connected) {
     console.log("SMTP transporter verified: YES");
     return true;
-  } catch (error) {
-    console.error("SMTP transporter verified: NO -", error.message);
+  } else {
+    console.error("SMTP transporter verified: NO -", diagnostic.message);
     return false;
   }
 }
@@ -167,7 +261,8 @@ async function sendEmail({ to, subject, text, html, icalEvent, attachments }) {
   };
 
   try {
-    const info = await transporter.sendMail(mailOptions);
+    const activeTransporter = getTransporter();
+    const info = await activeTransporter.sendMail(mailOptions);
     const accepted = Array.isArray(info.accepted) ? info.accepted : [];
     const rejected = Array.isArray(info.rejected) ? info.rejected : [];
     const isAccepted = accepted.length > 0 && !rejected.includes(cleanTo);
@@ -188,13 +283,14 @@ async function sendEmail({ to, subject, text, html, icalEvent, attachments }) {
         : "Recipient address was not accepted by SMTP server",
     };
   } catch (error) {
+    const sanitized = sanitizeSmtpError(error);
+    const sanitizedCode = error.code || (error.responseCode ? `E${error.responseCode}` : "ESMTP");
     console.error(
-      `[EmailService] SMTP Failure to ${maskEmail(cleanTo)}:`,
-      error.message
+      `[EmailService] SMTP Failure to ${maskEmail(cleanTo)}: ${sanitized} (code: ${sanitizedCode})`
     );
     return {
       success: false,
-      error: error.message,
+      error: sanitized,
       accepted: [],
       rejected: [cleanTo],
     };
@@ -594,8 +690,11 @@ async function sendOTPEmail(email, otp) {
 
 module.exports = {
   transporter,
+  getTransporter,
   maskEmail,
   isDeliverableEmail,
+  sanitizeSmtpError,
+  checkSmtpConnection,
   verifyTransporter,
   sendEmail,
   sendAdminMessageEmail,

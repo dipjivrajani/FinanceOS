@@ -48,16 +48,19 @@ async function runCalculationConsistencyAudit() {
       state: "Maharashtra",
     });
 
-    adminUser = await User.create({
-      userId: `ADM-CALC-${timestamp}`,
-      name: "Admin Auditor",
-      email: `admin_calc_${timestamp}@financeos-test.com`,
-      role: "admin",
-      status: "Active",
-      emailVerified: true,
-      city: "Mumbai",
-      state: "Maharashtra",
-    });
+    adminUser = await User.findOne({ email: "financeos.system@gmail.com" });
+    if (!adminUser) {
+      adminUser = await User.create({
+        userId: `ADM-CALC-${timestamp}`,
+        name: "Admin Auditor",
+        email: `admin_calc_${timestamp}@financeos-test.com`,
+        role: "admin",
+        status: "Active",
+        emailVerified: true,
+        city: "Mumbai",
+        state: "Maharashtra",
+      });
+    }
 
     userToken = jwt.sign(
       { id: testUser._id.toString(), userId: testUser.userId, email: testUser.email, role: "user" },
@@ -336,7 +339,7 @@ async function runCalculationConsistencyAudit() {
       await Insurance.deleteMany({ user: testUser._id });
       await Liability.deleteMany({ user: testUser._id });
     }
-    if (adminUser) {
+    if (adminUser && adminUser.email !== "financeos.system@gmail.com") {
       await User.deleteOne({ _id: adminUser._id });
     }
     await mongoose.disconnect();

@@ -643,6 +643,9 @@ function UserDashboard() {
       await loadMonthFinance(parsedPeriod.year, parsedPeriod.month);
       setSelectedGoalForContribution(null);
     } catch (err) {
+      if (err?.code === "INSUFFICIENT_FUNDS") {
+        setSelectedGoalForContribution(null);
+      }
       console.error("Goal contribution error:", err);
     } finally {
       setQuickGoalSubmitting(false);
@@ -664,6 +667,9 @@ function UserDashboard() {
       await loadMonthFinance(parsedPeriod.year, parsedPeriod.month);
       setSelectedInsuranceForPayment(null);
     } catch (err) {
+      if (err?.code === "INSUFFICIENT_FUNDS") {
+        setSelectedInsuranceForPayment(null);
+      }
       console.error("Insurance payment error:", err);
     } finally {
       setQuickInsSubmitting(false);
@@ -685,6 +691,9 @@ function UserDashboard() {
       await loadMonthFinance(parsedPeriod.year, parsedPeriod.month);
       setSelectedLiabilityForPayment(null);
     } catch (err) {
+      if (err?.code === "INSUFFICIENT_FUNDS") {
+        setSelectedLiabilityForPayment(null);
+      }
       console.error("Liability payment error:", err);
     } finally {
       setQuickLiabSubmitting(false);

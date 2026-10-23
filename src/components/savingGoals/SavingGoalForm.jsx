@@ -227,6 +227,7 @@ function SavingGoalForm({
     insurancePolicies,
     liabilities,
     availableToAllocate,
+    showInsufficientFundsModal,
     addSavingGoal,
 
   } = useFinance();
@@ -910,17 +911,14 @@ function SavingGoalForm({
       alreadySaved > 0 &&
       alreadySaved > availableToAllocate
     ) {
-
-      setError(
-        `Initial contribution of ₹${formatMoney(
-          alreadySaved
-        )} exceeds your available to allocate of ₹${formatMoney(
-          availableToAllocate
-        )}.`
-      );
-
+      if (typeof onClose === "function") {
+        onClose();
+      }
+      showInsufficientFundsModal({
+        availableAmount: availableToAllocate,
+        requestedAmount: alreadySaved,
+      });
       return;
-
     }
 
 
@@ -1134,6 +1132,12 @@ function SavingGoalForm({
       }
 
     } catch (err) {
+      if (err?.code === "INSUFFICIENT_FUNDS") {
+        if (typeof onClose === "function") {
+          onClose();
+        }
+        return;
+      }
       console.error("Failed to create saving goal:", err);
       setError(
         err?.message ||
